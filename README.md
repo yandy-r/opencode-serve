@@ -133,7 +133,12 @@ OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
    password `config/opencode/service.json`) and the unit
    `~/.config/systemd/user/opencode-serve.service`. Unit names are fixed;
    rerun install after moving root. First installation requires an empty,
-   dedicated root; unrelated nonempty directories are refused. Operations on
+   dedicated root, except for `.install.lock` and a real (not symlink)
+   `completions/` directory created by shell completion setup. Completion
+   contents stay untouched during installation. Other nonempty, unrecognized
+   roots are refused; guided and flags-based setup report the root and
+   unexpected entry names with terminal-safe escaping. Recognized reinstallations
+   remain supported. Operations on
    the shared unit and Serve configuration are serialized by a private lock at
    `~/.local/state/opencode-serve/operation.lock`. Fails closed: any fetch/validation error
    aborts before replacing working files. Secret values already fetched in
@@ -184,7 +189,8 @@ the unit, and reloads systemd. It then removes the copied launcher while keeping
 the database, `runtime.json` (including saved provider credentials), password,
 and remaining config/state/cache files. Reinstall with your original options
 to use the retained data. `--purge` deletes the complete installation directory,
-including credentials and database; it also works after a prior removal.
+including credentials, database, and any `completions/` directory under that
+root; it also works after a prior removal.
 Purge refuses to discard a managed or pending Serve recovery record until
 cleanup is verified. Resolve the reported Serve state and retry removal.
 Home/shared config directories, unrecognized roots, and root symlinks are

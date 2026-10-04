@@ -257,6 +257,10 @@ class _Cancel(Exception):
     pass
 
 
+class RootRefusal(ValueError):
+    """Unrecognized nonempty install root. Message carries only escaped paths, safe to print."""
+
+
 def cancelled(dirty):
     if dirty:
         print("Cancelled; existing writes and service changes are retained.")
@@ -427,12 +431,21 @@ def do_install(
     binary = executable(binary_name)
     op = executable("op") if refs else None
     with operation_lock():
-        if (
-            root.exists()
-            and any(p.name != ".install.lock" for p in root.iterdir())
-            and not recognized_install(root, runtime_config(root))
-        ):
-            raise ValueError("first install requires an empty, dedicated directory")
+        if root.exists() and not recognized_install(root, runtime_config(root)):
+            # `completion --install` writes <root>/completions for the default root; its
+            # contents stay untouched. Everything else unexpected keeps the refusal.
+            unexpected = [
+                p.name
+                for p in root.iterdir()
+                if p.name != ".install.lock"
+                and not (p.name == "completions" and p.is_dir() and not p.is_symlink())
+            ]
+            if unexpected:
+                raise RootRefusal(
+                    "first install requires an empty, dedicated directory; refusing root "
+                    f"{ascii(str(root))}: unexpected entries: "
+                    + ", ".join(ascii(name) for name in sorted(unexpected))
+                )
         private_dir(root)
         # One writer; fetch all values before replacing any working runtime files.
         with file_lock(root / ".install.lock"):
@@ -1006,6 +1019,10 @@ def guided_install():
                     use_ts=use_ts,
                     hostname=hostname,
                 )
+            except RootRefusal as error:
+                # Message is built only from escaped root/entry names; no exception text.
+                print(f"opencode-serve: {error}", file=sys.stderr)
+                return 1
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 print(
                     "opencode-serve: failed; check inputs, private-file permissions and CLI availability",
@@ -1286,6 +1303,10 @@ def main():
         try:
             os.umask(0o077)
             install(args)
+        except RootRefusal as error:
+            # Message is built only from escaped root/entry names; no exception text.
+            print(f"opencode-serve: {error}", file=sys.stderr)
+            return 1
         except (OSError, ValueError, subprocess.TimeoutExpired):
             # Do not print exception strings: JSON / subprocess errors may contain secrets.
             print(

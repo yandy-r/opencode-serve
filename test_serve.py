@@ -750,6 +750,82 @@ def remove_checks(mod, base, home, bindir):
         and (occupied / "important").read_text() == "unrelated project"
         and not (occupied / "runtime.json").exists(),
     )
+    weird = base / "nonempty-escaped"
+    weird.mkdir()
+    (weird / 'ev\ti"l').write_text("x")
+    rejected = do_install(mod, base, home, bindir, {}, weird)
+    check(
+        "explicit refusal names escaped root and entries, no writes",
+        rejected.returncode == 1
+        and "unexpected entries" in rejected.stderr
+        and "'ev\\ti\"l'" in rejected.stderr
+        and ascii(str(weird)) in rejected.stderr
+        and "\t" not in rejected.stderr
+        and not (weird / "runtime.json").exists(),
+    )
+    # `completion --install` before first install: real generated files, kept byte-for-byte.
+    comp_root = base / "share" / "opencode-serve"
+    comp_root.mkdir(parents=True)
+    comp_env = dict(
+        os.environ,
+        HOME=str(home),
+        PATH=str(bindir),
+        XDG_CONFIG_HOME=str(home / ".config"),
+        XDG_DATA_HOME=str(comp_root.parent),
+        SHELL="/bin/bash",
+    )
+    comp_ok = True
+    for shell in ("bash", "zsh"):
+        done = subprocess.run(
+            [sys.executable, str(REPO / "serve.py"), "completion", shell, "--install"],
+            env=comp_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        comp_ok = comp_ok and done.returncode == 0
+    pre = {
+        shell: (comp_root / f"completions/serve.py.{shell}").read_bytes()
+        for shell in ("bash", "zsh")
+    }
+    check(
+        "pre-install generated completions",
+        comp_ok and all(pre[shell] == mod.COMPLETIONS[shell].encode() for shell in pre),
+    )
+    first = do_install(mod, base, home, bindir, {}, comp_root)
+    check(
+        "install accepts completions-only root, contents untouched",
+        first.returncode == 0
+        and (comp_root / "runtime.json").exists()
+        and all((comp_root / f"completions/serve.py.{s}").read_bytes() == pre[s] for s in pre),
+    )
+    again = do_install(mod, base, home, bindir, {}, comp_root)
+    check(
+        "reinstall over completions root recognized",
+        again.returncode == 0
+        and all((comp_root / f"completions/serve.py.{s}").read_bytes() == pre[s] for s in pre),
+    )
+    link_root = base / "comp-symlink-root"
+    (base / "comp-target").mkdir()
+    link_root.mkdir()
+    (link_root / "completions").symlink_to(base / "comp-target", target_is_directory=True)
+    rejected = do_install(mod, base, home, bindir, {}, link_root)
+    check(
+        "install refuses completions symlink",
+        rejected.returncode == 1
+        and "'completions'" in rejected.stderr
+        and not (link_root / "runtime.json").exists(),
+    )
+    file_root = base / "comp-file-root"
+    file_root.mkdir()
+    (file_root / "completions").write_text("not a directory")
+    rejected = do_install(mod, base, home, bindir, {}, file_root)
+    check(
+        "install refuses non-directory completions",
+        rejected.returncode == 1
+        and "'completions'" in rejected.stderr
+        and not (file_root / "runtime.json").exists(),
+    )
     victim = base / "lock-victim"
     victim.write_text("unrelated secret data")
     victim.chmod(0o640)
@@ -1605,6 +1681,27 @@ def _guided_checks(mod, base, home, bindir):
     rc = mod.guided_install()
     guided_teardown(mod, saved, st, origs)
     check("guided non-tty refuses", rc == 1 and not st["installs"] and not st["cmds"])
+
+    # foreign root contents refused with escaped names, no writes (real installer guard)
+    goccupied = base / "guided-occupied"
+    goccupied.mkdir(exist_ok=True)
+    (goccupied / "keep\tme").write_text("precious")
+    saved = guided_env(home)
+    st, origs = guided_setup(mod, [str(goccupied), "", str(bindir / "opencode"), "", "y", "n"])
+    mod.do_install = origs[3]  # real do_install: the root guard must run
+    buf, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        rc = mod.guided_install()
+    guided_teardown(mod, saved, st, origs)
+    check(
+        "guided refuses unrecognized root, escaped names, no writes",
+        rc == 1
+        and "unexpected entries" in err.getvalue()
+        and "'keep\\tme'" in err.getvalue()
+        and ascii(str(goccupied)) in err.getvalue()
+        and (goccupied / "keep\tme").read_text() == "precious"
+        and not (goccupied / "runtime.json").exists(),
+    )
 
     # cancel at summary writes nothing
     saved = guided_env(home)
