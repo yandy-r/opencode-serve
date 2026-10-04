@@ -5,16 +5,22 @@ import argparse
 import base64
 import contextlib
 import fcntl
+import getpass
 import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import warnings
 from pathlib import Path
 
 RESERVED = {
@@ -28,6 +34,211 @@ RESERVED = {
 }
 
 DEFAULT_PORT = 4096
+_OPERATION_MUTEX = threading.RLock()
+_HELD_OPERATION_LOCK = None
+
+COMPLETIONS = {
+    "bash": r"""# opencode-serve Bash completion (source this file).
+_opencode_serve() {
+    local cur prev action options candidate
+    cur=${COMP_WORDS[COMP_CWORD]}
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+    action=${COMP_WORDS[1]}
+    COMPREPLY=()
+    case "$prev" in
+        --password|--pasword|--port|--hostname) return ;;
+        --use-ts)
+            while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -W 'true false' -- "$cur")
+            return ;;
+        --root|--secrets|--opencode)
+            while IFS= read -r -d '' candidate; do COMPREPLY+=("$candidate"); done < <(
+                unset GLOBIGNORE
+                shopt -s nullglob
+                shopt -u failglob
+                for candidate in "$cur"*; do
+                    if [[ "$prev" == --root ]]; then
+                        [[ -d "$candidate" ]] || continue
+                    else
+                        [[ -e "$candidate" || -L "$candidate" ]] || continue
+                    fi
+                    printf '%s\0' "$candidate"
+                done
+            )
+            compopt -o filenames 2>/dev/null || :
+            return ;;
+    esac
+    options='--help -h'
+    case "$action" in
+        install) options+=' --root --secrets --opencode --port --password --pasword --use-ts --hostname' ;;
+        run) options+=' --root' ;;
+        remove) options+=' --root --purge' ;;
+        completion) options+=' bash zsh fish --install --force' ;;
+        *) options+=' install run completion remove' ;;
+    esac
+    while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -W "$options" -- "$cur")
+}
+complete -F _opencode_serve serve.py
+""",
+    "zsh": r"""# opencode-serve Zsh completion (source this file).
+_opencode_serve() {
+    local context state state_descr line
+    typeset -A opt_args
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[Show help]' \
+        '1:action:(install run completion remove)' \
+        '*::argument:->arguments'
+    case "$state" in
+        arguments)
+            case "$line[1]" in
+                install)
+                    _arguments \
+                        '--root[Install root]:directory:_directories' \
+                        '--secrets[1Password references JSON]:file:_files' \
+                        '--opencode[OpenCode executable]:executable:_files' \
+                        '--port[Listen port]:port:' \
+                        '--use-ts[Use Tailscale networking]:boolean:(true false)' \
+                        '--hostname[Bind IP for external proxy]:IP address:' \
+                        '(--password --pasword)'{--password,--pasword}'[Set server password]:password:' \
+                        '(-h --help)'{-h,--help}'[Show help]' ;;
+                run)
+                    _arguments '--root[Install root]:directory:_directories' \
+                        '(-h --help)'{-h,--help}'[Show help]' ;;
+                remove)
+                    _arguments '--root[Install root]:directory:_directories' \
+                        '--purge[Delete installation data and credentials]' \
+                        '(-h --help)'{-h,--help}'[Show help]' ;;
+                completion)
+                    _arguments '1:shell:(bash zsh fish)' \
+                        '--install[Install user shell completions]' \
+                        '--force[Replace existing completion file]' \
+                        '(-h --help)'{-h,--help}'[Show help]' ;;
+            esac ;;
+    esac
+}
+if (( ! $+functions[compdef] )); then
+    autoload -Uz compinit
+    compinit
+fi
+compdef _opencode_serve serve.py
+""",
+    "fish": r"""# opencode-serve Fish completion.
+complete -c serve.py -f
+complete -c serve.py -n '__fish_use_subcommand' -a 'install run completion remove'
+complete -c serve.py -s h -l help -d 'Show help'
+complete -c serve.py -n '__fish_seen_subcommand_from install run remove' -l root -r -a '(__fish_complete_directories)' -d 'Install root'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l secrets -r -F -d '1Password references JSON'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l opencode -r -F -d 'OpenCode executable'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l port -x -d 'Listen port'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l use-ts -x -a 'true false' -d 'Use Tailscale networking'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l hostname -x -d 'Bind IP for external proxy'
+complete -c serve.py -n '__fish_seen_subcommand_from remove' -l purge -d 'Delete installation data and credentials'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l password -x -d 'Set server password'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l pasword -x -d 'Set server password'
+complete -c serve.py -n '__fish_seen_subcommand_from completion; and not __fish_seen_subcommand_from bash zsh fish' -a 'bash zsh fish'
+complete -c serve.py -n '__fish_seen_subcommand_from completion' -l install -d 'Install user shell completions'
+complete -c serve.py -n '__fish_seen_subcommand_from completion' -l force -d 'Replace existing completion file'
+""",
+}
+
+
+def install_completion(shell, force):
+    home = Path.home()
+    if shell == "fish":
+        config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+        # Eager loading also supports ./serve.py when its directory is not on PATH.
+        destination = config / "fish/conf.d/opencode-serve.fish"
+        rc = None
+    else:
+        data = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share"))
+        destination = data / "opencode-serve/completions" / f"serve.py.{shell}"
+        rc = (
+            Path(os.environ.get("ZDOTDIR", home)) / ".zshrc" if shell == "zsh" else home / ".bashrc"
+        ).resolve()
+    destination = destination.absolute()
+    if destination.exists() and not destination.is_symlink() and not destination.is_file():
+        raise ValueError(
+            "completion path is not a regular file; choose a different data/config directory"
+        )
+    if (destination.exists() or destination.is_symlink()) and not force:
+        raise ValueError("completion file exists; use --force to replace it")
+    rc_text = None
+    if rc is not None:
+        previous = rc.read_text() if rc.exists() else ""
+        start, end = "# >>> opencode-serve completion >>>", "# <<< opencode-serve completion <<<"
+        block = f"{start}\nif [ -r {shlex.quote(str(destination))} ]; then\n    . {shlex.quote(str(destination))}\nfi\n{end}"
+        if start in previous or end in previous:
+            if previous.count(start) != 1 or previous.count(end) != 1:
+                raise ValueError(
+                    "invalid completion block in shell config; fix it before installing"
+                )
+            before, rest = previous.split(start)
+            if end not in rest:
+                raise ValueError(
+                    "invalid completion block in shell config; fix it before installing"
+                )
+            _, after = rest.split(end)
+            rc_text = before + block + after
+        else:
+            rc_text = (
+                previous + ("\n" if previous and not previous.endswith("\n") else "") + block + "\n"
+            )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if destination.exists() or destination.is_symlink():
+        fd, name = tempfile.mkstemp(prefix=".completion-backup-", dir=destination.parent)
+        os.close(fd)
+        backup = Path(name)
+        try:
+            backup.unlink()
+            shutil.copy2(destination, backup, follow_symlinks=False)
+        except OSError:
+            backup.unlink(missing_ok=True)
+            raise
+    try:
+        atomic(destination, COMPLETIONS[shell], mode=0o644)
+        if rc is not None:
+            rc.parent.mkdir(parents=True, exist_ok=True)
+            mode = rc.stat().st_mode & 0o777 if rc.exists() else 0o600
+            atomic(rc, rc_text, mode=mode)
+    except (OSError, ValueError):
+        try:
+            if backup is not None:
+                os.replace(backup, destination)
+            else:
+                destination.unlink(missing_ok=True)
+        except OSError as error:
+            recovery = f"previous completion retained at {backup}" if backup else str(destination)
+            raise OSError(f"completion rollback failed; inspect {recovery}") from error
+        raise
+    if backup is not None:
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            print(f"Completion installed; old backup retained at {backup}", file=sys.stderr)
+    print(f"Installed {shell} completions: {destination}")
+    print("Open a new shell to load the completions.")
+
+
+def completion_main(argv):
+    parser = argparse.ArgumentParser(description="Print or install shell completions.")
+    parser.add_argument("shell", nargs="?", choices=tuple(COMPLETIONS), help="default: $SHELL")
+    parser.add_argument("--install", action="store_true", help="install for the current user")
+    parser.add_argument("--force", action="store_true", help="replace an existing completion file")
+    args = parser.parse_args(argv)
+    if args.force and not args.install:
+        parser.error("--force requires --install")
+    shell = args.shell or Path(os.environ.get("SHELL", "")).name
+    if shell not in COMPLETIONS:
+        parser.error("specify bash, zsh or fish, or set $SHELL to a supported shell")
+    if not args.install:
+        print(COMPLETIONS[shell], end="")
+        return 0
+    try:
+        install_completion(shell, args.force)
+    except (OSError, ValueError) as error:
+        print(f"opencode-serve: completion install failed: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def default_root():
@@ -104,6 +315,86 @@ def executable(name):
     return str(Path(path).absolute())
 
 
+def network_settings(use_ts, hostname=None):
+    if not isinstance(use_ts, bool):
+        raise ValueError("use_ts must be true or false")
+    hostname = hostname if hostname is not None else ("127.0.0.1" if use_ts else "0.0.0.0")
+    if not isinstance(hostname, str):
+        raise ValueError("hostname must be an IP address")
+    hostname = str(ipaddress.ip_address(hostname))
+    if use_ts and hostname != "127.0.0.1":
+        raise ValueError("Tailscale Serve requires the 127.0.0.1 listener")
+    return hostname
+
+
+def probe_hostname(hostname):
+    return {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(hostname, hostname)
+
+
+def runtime_config(root):
+    path = root / "runtime.json"
+    if not path.exists():
+        return {}
+    config = json.loads(path.read_text())
+    if not isinstance(config, dict):
+        raise ValueError("runtime must be a JSON object")
+    return config
+
+
+@contextlib.contextmanager
+def file_lock(path):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("lock path must be a regular file")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("lock path must be a regular file")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def operation_lock():
+    """Serialize the shared user unit and Serve mutations, including nested calls."""
+    global _HELD_OPERATION_LOCK
+    path = Path.home() / ".local/state/opencode-serve/operation.lock"
+    with _OPERATION_MUTEX:
+        if _HELD_OPERATION_LOCK is not None:
+            if path != _HELD_OPERATION_LOCK:
+                raise ValueError("home changed during a service operation")
+            yield
+            return
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with file_lock(path):
+            _HELD_OPERATION_LOCK = path
+            try:
+                yield
+            finally:
+                _HELD_OPERATION_LOCK = None
+
+
+def recognized_install(root, config):
+    if config.get("install_root") == str(root):
+        return True
+    launcher = root / "serve.py"
+    return (
+        launcher.is_file()
+        and not launcher.is_symlink()
+        and launcher.read_text().startswith(
+            '#!/usr/bin/env python3\n"""Install or launch isolated OpenCode foreground server. Python stdlib only."""'
+        )
+        and all(key in config for key in ("binary", "home", "env", "port"))
+    )
+
+
 def validated_refs(refs):
     if not isinstance(refs, dict):
         raise ValueError("references must be a JSON object")
@@ -123,7 +414,11 @@ def validated_refs(refs):
     return refs
 
 
-def do_install(root, refs, binary_name, port, keep_env=None):
+def do_install(
+    root, refs, binary_name, port, keep_env=None, password=None, use_ts=None, hostname=None
+):
+    if password is not None and (not isinstance(password, str) or not password or "\0" in password):
+        raise ValueError("password must be a nonempty string without NUL")
     root = Path(root).absolute()
     home = Path.home()
     host_config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "opencode"
@@ -131,86 +426,128 @@ def do_install(root, refs, binary_name, port, keep_env=None):
     refs = validated_refs(refs)
     binary = executable(binary_name)
     op = executable("op") if refs else None
-    private_dir(root)
-    # One writer; fetch all values before replacing any working runtime files.
-    with (root / ".install.lock").open("w") as lock:
-        os.fchmod(lock.fileno(), 0o600)
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if keep_env is not None:
-            fetched = dict(keep_env)
-        else:
-            fetched = {}
-            for name, ref in refs.items():
-                result = subprocess.run(
-                    [op, "read", "--no-newline", ref],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    timeout=60,
+    with operation_lock():
+        if (
+            root.exists()
+            and any(p.name != ".install.lock" for p in root.iterdir())
+            and not recognized_install(root, runtime_config(root))
+        ):
+            raise ValueError("first install requires an empty, dedicated directory")
+        private_dir(root)
+        # One writer; fetch all values before replacing any working runtime files.
+        with file_lock(root / ".install.lock"):
+            previous = runtime_config(root)
+            old_mode = previous.get("use_ts", True)
+            use_ts = old_mode if use_ts is None else use_ts
+            if hostname is None and use_ts == old_mode:
+                hostname = previous.get("hostname")
+            hostname = network_settings(use_ts, hostname)
+            if keep_env is not None:
+                fetched = dict(keep_env)
+            else:
+                fetched = {}
+                for name, ref in refs.items():
+                    result = subprocess.run(
+                        [op, "read", "--no-newline", ref],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        timeout=60,
+                    )
+                    if result.returncode:
+                        raise ValueError("secret fetch failed; previous runtime unchanged")
+                    value = result.stdout.decode("utf-8")  # No stripping or newline translation.
+                    if not value or "\0" in value:
+                        raise ValueError("empty or NUL secret; previous runtime unchanged")
+                    fetched[name] = value
+            for sub in ("config/opencode", "data", "state", "cache"):
+                private_dir(root / sub)
+            service = root / "config/opencode/service.json"
+            if service.exists() and password is None:
+                saved = json.loads(service.read_text())
+                if (
+                    not isinstance(saved, dict)
+                    or not isinstance(saved.get("password"), str)
+                    or not saved["password"]
+                ):
+                    raise ValueError("existing service password invalid; refusing replacement")
+            owned_serve = previous.get("tailscale_serve")
+            if owned_serve and (not use_ts or previous.get("port") != port):
+                if not clear_owned_serve(previous):
+                    raise ValueError(
+                        "cannot change networking until the managed Serve mapping is removed"
+                    )
+                owned_serve = None
+            if password is not None or not service.exists():
+                atomic(
+                    service,
+                    json.dumps(
+                        {
+                            "password": (
+                                password if password is not None else secrets.token_urlsafe(32)
+                            )
+                        }
+                    )
+                    + "\n",
                 )
-                if result.returncode:
-                    raise ValueError("secret fetch failed; previous runtime unchanged")
-                value = result.stdout.decode("utf-8")  # No stripping or newline translation.
-                if not value or "\0" in value:
-                    raise ValueError("empty or NUL secret; previous runtime unchanged")
-                fetched[name] = value
-        for sub in ("config/opencode", "data", "state", "cache"):
-            private_dir(root / sub)
-        service = root / "config/opencode/service.json"
-        if service.exists():
-            saved = json.loads(service.read_text())
-            if (
-                not isinstance(saved, dict)
-                or not isinstance(saved.get("password"), str)
-                or not saved["password"]
-            ):
-                raise ValueError("existing service password invalid; refusing replacement")
-        else:
-            atomic(service, json.dumps({"password": secrets.token_urlsafe(32)}) + "\n")
-        service.chmod(0o600)
-        # Config entries are shared intentionally; service.json never shared.
-        if host_config.is_dir():
-            for source in host_config.iterdir():
-                if source.name == "service.json":
-                    continue
-                target = root / "config/opencode" / source.name
-                if not target.exists() and not target.is_symlink():
-                    target.symlink_to(source.absolute(), target_is_directory=source.is_dir())
-        config = {
-            "binary": binary,
-            "path": os.environ.get("PATH", os.defpath),
-            "home": str(home),
-            "port": port,
-            "env": fetched,
-        }
-        atomic(root / "runtime.json", json.dumps(config) + "\n")
-        atomic(root / "serve.py", Path(__file__).read_text())
-        template = Path(__file__).with_name("opencode-serve.service.in").read_text()
-        unit = template.replace(
-            "@EXEC@",
-            " ".join(
-                quote(x)
-                for x in [executable(sys.executable), root / "serve.py", "run", "--root", root]
-            ),
-        )
-        unit_dir.mkdir(parents=True, exist_ok=True)
-        atomic(unit_dir / "opencode-serve.service", unit)
+            service.chmod(0o600)
+            # Config entries are shared intentionally; service.json never shared.
+            if host_config.is_dir():
+                for source in host_config.iterdir():
+                    if source.name == "service.json":
+                        continue
+                    target = root / "config/opencode" / source.name
+                    if not target.exists() and not target.is_symlink():
+                        target.symlink_to(source.absolute(), target_is_directory=source.is_dir())
+            config = {
+                "binary": binary,
+                "path": os.environ.get("PATH", os.defpath),
+                "home": str(home),
+                "port": port,
+                "env": fetched,
+                "hostname": hostname,
+                "use_ts": use_ts,
+                "install_root": str(root),
+            }
+            if owned_serve:
+                config["tailscale_serve"] = owned_serve
+            atomic(root / "runtime.json", json.dumps(config) + "\n")
+            atomic(root / "serve.py", Path(__file__).read_text())
+            template = Path(__file__).with_name("opencode-serve.service.in").read_text()
+            unit = template.replace(
+                "@EXEC@",
+                " ".join(
+                    quote(x)
+                    for x in [executable(sys.executable), root / "serve.py", "run", "--root", root]
+                ),
+            )
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            atomic(unit_dir / "opencode-serve.service", unit)
 
 
 def install(args):
-    root = (args.root or default_root()).absolute()
-    refs, keep = {}, None
-    if args.secrets is not None:
-        refs = validated_refs(json.loads(args.secrets.read_text()))
-    else:
-        try:
-            saved_env = json.loads((root / "runtime.json").read_text()).get("env")
-            if isinstance(saved_env, dict) and saved_env:
-                keep = saved_env
-        except (OSError, ValueError):
-            pass
-    do_install(
-        root, refs, args.opencode or default_opencode(), args.port or DEFAULT_PORT, keep_env=keep
-    )
+    with operation_lock():
+        root = (args.root or default_root()).absolute()
+        previous = runtime_config(root)
+        refs, keep = {}, None
+        if args.secrets is not None:
+            refs = validated_refs(json.loads(args.secrets.read_text()))
+        else:
+            try:
+                saved_env = json.loads((root / "runtime.json").read_text()).get("env")
+                if isinstance(saved_env, dict) and saved_env:
+                    keep = saved_env
+            except (OSError, ValueError):
+                pass
+        do_install(
+            root,
+            refs,
+            args.opencode or previous.get("binary") or default_opencode(),
+            port_value(args.port if args.port is not None else previous.get("port", DEFAULT_PORT)),
+            keep_env=keep,
+            password=args.password,
+            use_ts=args.use_ts,
+            hostname=args.hostname,
+        )
 
 
 def ask(text, default=None):
@@ -238,6 +575,26 @@ def ask_yes(text, default_yes):
     return ask_yes(text, default_yes)
 
 
+def ask_password():
+    while True:
+        try:
+            # Refuse getpass's echoed-input fallback if terminal access fails.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                password = getpass.getpass("Server password (Enter to keep existing or generate): ")
+                if not password:
+                    return None
+                if "\0" in password:
+                    print("Password cannot contain NUL.")
+                    continue
+                confirmation = getpass.getpass("Confirm server password: ")
+        except (EOFError, getpass.GetPassWarning):
+            raise _Cancel() from None
+        if password == confirmation:
+            return password
+        print("Passwords do not match; try again.")
+
+
 def cmd(argv):
     try:
         return subprocess.run(argv, capture_output=True, timeout=60)
@@ -252,9 +609,9 @@ def denied(result):
 API_INFO = "/api/info"  # documented V2 endpoint; 200 + JSON object when authed
 
 
-def api_get(port, token=None, timeout=5):
-    """GET /api/info on loopback. http.client: no proxy env, no redirects."""
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+def api_get(port, token=None, timeout=5, hostname="127.0.0.1"):
+    """GET /api/info directly. http.client: no proxy env, no redirects."""
+    conn = http.client.HTTPConnection(probe_hostname(hostname), port, timeout=timeout)
     try:
         headers = {"Authorization": "Basic " + token} if token else {}
         conn.request("GET", API_INFO, headers=headers)
@@ -270,16 +627,18 @@ def basic_token(password):
     return base64.b64encode(("opencode:" + password).encode()).decode()
 
 
-def port_listening(port):
-    return api_get(port)[0] is not None
+def port_listening(port, hostname="127.0.0.1"):
+    return api_get(port, hostname=hostname)[0] is not None
 
 
-def verify_service(port, password, attempts=10):
+def verify_service(port, password, attempts=10, hostname="127.0.0.1"):
     """Bounded: wrong/no Basic auth denied AND correct auth 200 JSON object."""
     good, bad = basic_token(password), basic_token(password + "-wrong")
     for _ in range(attempts):
-        if api_get(port, bad)[0] in (401, 403) and api_get(port)[0] in (401, 403):
-            status, body = api_get(port, good)
+        if api_get(port, bad, hostname=hostname)[0] in (401, 403) and api_get(
+            port, hostname=hostname
+        )[0] in (401, 403):
+            status, body = api_get(port, good, hostname=hostname)
             if status == 200:
                 try:
                     return isinstance(json.loads(body), dict)
@@ -323,6 +682,228 @@ def serve_matches(cfg, dns, port):
     return handler["Proxy"] in (f"http://127.0.0.1:{port}/", f"http://127.0.0.1:{port}")
 
 
+def record_serve(root, dns, port):
+    with operation_lock(), file_lock(root / ".install.lock"):
+        config = runtime_config(root)
+        if not config.get("use_ts", True) or config.get("port") != port:
+            raise ValueError("installation changed during Tailscale setup")
+        config["tailscale_serve"] = {"dns": dns, "port": port}
+        atomic(root / "runtime.json", json.dumps(config) + "\n")
+
+
+def create_serve(root, dns, port):
+    with operation_lock(), file_lock(root / ".install.lock"):
+        config = runtime_config(root)
+        if config.get("removed") or not config.get("use_ts", True) or config.get("port") != port:
+            raise ValueError("installation changed during Tailscale setup")
+        current = cmd(["tailscale", "serve", "status", "--json"])
+        try:
+            empty = (
+                current is not None
+                and current.returncode == 0
+                and json.loads(current.stdout) in (None, {})
+            )
+        except (ValueError, TypeError):
+            empty = False
+        if not empty:
+            raise ValueError("Serve state changed; refusing to overwrite")
+        # Durable pending state permits recovery if the process dies during the RPC.
+        config["tailscale_serve"] = {"dns": dns, "port": port, "pending": True}
+        atomic(root / "runtime.json", json.dumps(config) + "\n")
+        argv = ["tailscale", "serve", "--bg", f"http://127.0.0.1:{port}"]
+        result = cmd(argv)
+        current = cmd(["tailscale", "serve", "status", "--json"])
+        try:
+            cfg = (
+                json.loads(current.stdout)
+                if current is not None and current.returncode == 0
+                else "unknown"
+            )
+        except (ValueError, TypeError):
+            cfg = "unknown"
+        if cfg in (None, {}):
+            config.pop("tailscale_serve")
+            atomic(root / "runtime.json", json.dumps(config) + "\n")
+        elif serve_matches(cfg, dns, port):
+            config["tailscale_serve"] = {"dns": dns, "port": port}
+            atomic(root / "runtime.json", json.dumps(config) + "\n")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        else:
+            print(
+                "Serve setup unverified; pending recovery metadata retained. Inspect tailscale serve status before retrying.",
+                file=sys.stderr,
+            )
+        return (
+            result
+            if result is not None and result.returncode
+            else subprocess.CompletedProcess(argv, 1, b"", b"")
+        )
+
+
+def clear_owned_serve(config):
+    with operation_lock():
+        owned = config.get("tailscale_serve")
+        if not owned:
+            return True
+        if not isinstance(owned, dict) or not isinstance(owned.get("dns"), str):
+            raise ValueError("invalid managed Tailscale metadata")
+        port = port_value(owned.get("port"))
+        if not shutil.which("tailscale"):
+            print(
+                "Managed Serve mapping retained: tailscale unavailable; inspect tailscale serve status.",
+                file=sys.stderr,
+            )
+            return False
+        current = cmd(["tailscale", "serve", "status", "--json"])
+        try:
+            if current is None or current.returncode:
+                raise ValueError("Serve state unavailable")
+            cfg = json.loads(current.stdout)
+        except (ValueError, TypeError):
+            print(
+                "Cannot inspect managed Serve mapping; inspect tailscale serve status.",
+                file=sys.stderr,
+            )
+            return False
+        if cfg in (None, {}):
+            return True
+        if owned.get("pending"):
+            print(
+                "Pending Serve setup retained; inspect tailscale serve status and resolve it before purging.",
+                file=sys.stderr,
+            )
+            return False
+        if not serve_matches(cfg, owned["dns"], port):
+            print(
+                "Shared or changed Serve config retained; inspect tailscale serve status.",
+                file=sys.stderr,
+            )
+            return False
+        removed = cmd(["tailscale", "serve", "--https=443", "off"])
+        if removed is None or removed.returncode:
+            print(
+                "Cannot remove managed Serve mapping; run: tailscale serve --https=443 off",
+                file=sys.stderr,
+            )
+            return False
+        current = cmd(["tailscale", "serve", "status", "--json"])
+        try:
+            cleared = (
+                current is not None
+                and current.returncode == 0
+                and json.loads(current.stdout) in (None, {})
+            )
+        except (ValueError, TypeError):
+            cleared = False
+        if not cleared:
+            print("Serve removal unverified; inspect tailscale serve status.", file=sys.stderr)
+        return cleared
+
+
+def remove_installation(root, purge=False):
+    with operation_lock():
+        root = Path(root).absolute()
+        home = Path.home()
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+        unit = config_home / "systemd/user/opencode-serve.service"
+        if (
+            not root.exists()
+            and not root.is_symlink()
+            and not unit.exists()
+            and not unit.is_symlink()
+        ):
+            print("opencode-serve is not installed; nothing to remove.")
+            return
+        if root.is_symlink():
+            raise ValueError("refusing a symlink install root")
+        protected = {home.resolve(), config_home.resolve(), (home / ".local").resolve()}
+        protected.update(
+            Path(os.environ.get(name, home / default)).resolve()
+            for name, default in (
+                ("XDG_DATA_HOME", ".local/share"),
+                ("XDG_STATE_HOME", ".local/state"),
+                ("XDG_CACHE_HOME", ".cache"),
+            )
+        )
+        if root.resolve() in protected or root.resolve() in home.resolve().parents:
+            raise ValueError("refusing removal from a home or shared config/data directory")
+        config = runtime_config(root)
+        if root.exists() and not recognized_install(root, config):
+            raise ValueError("directory is not a recognized opencode-serve installation")
+        with contextlib.ExitStack() as stack:
+            if root.exists():
+                stack.enter_context(file_lock(root / ".install.lock"))
+                config = runtime_config(root)
+            if unit.exists() or unit.is_symlink():
+                exec_lines = [
+                    line for line in unit.read_text().splitlines() if line.startswith("ExecStart=")
+                ]
+                suffix = " " + " ".join(
+                    quote(x) for x in (root / "serve.py", "run", "--root", root)
+                )
+                if len(exec_lines) != 1 or not exec_lines[0].endswith(suffix):
+                    raise ValueError("user unit belongs to another installation; nothing removed")
+                stopped = cmd(["systemctl", "--user", "disable", "--now", "opencode-serve.service"])
+                active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
+                if (
+                    stopped is None
+                    or stopped.returncode
+                    or active is None
+                    or active.returncode not in (3, 4)
+                ):
+                    raise ValueError("service stop unverified; no files removed")
+            elif root.exists() and not config.get("removed"):
+                active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
+                if active is None or active.returncode not in (3, 4):
+                    raise ValueError("unit is missing and shutdown is unverified; no files removed")
+            if config:
+                # A failed/shared Serve cleanup never removes other apps' mappings.
+                cleared = clear_owned_serve(config)
+                if purge and not cleared:
+                    raise ValueError("purge refused until managed Tailscale cleanup is verified")
+                config["removed"] = True
+                if cleared:
+                    config.pop("tailscale_serve", None)
+                atomic(root / "runtime.json", json.dumps(config) + "\n")
+            unit.unlink(missing_ok=True)
+            reloaded = cmd(["systemctl", "--user", "daemon-reload"])
+            if reloaded is None or reloaded.returncode:
+                raise ValueError("unit removed; run systemctl --user daemon-reload before retrying")
+            if root.exists():
+                if purge:
+                    shutil.rmtree(root)
+                else:
+                    (root / "serve.py").unlink(missing_ok=True)
+            print(
+                "Uninstalled opencode-serve."
+                + (
+                    " Installation data deleted."
+                    if purge
+                    else f" Data and credentials retained at {root}."
+                )
+            )
+
+
+def remove_main(argv):
+    parser = argparse.ArgumentParser(
+        description="Stop and uninstall the server; retain data unless --purge."
+    )
+    parser.add_argument("--root", type=Path, default=default_root())
+    parser.add_argument(
+        "--purge", action="store_true", help="delete the complete installation directory"
+    )
+    args = parser.parse_args(argv)
+    try:
+        remove_installation(args.root, args.purge)
+    except (OSError, ValueError):
+        print(
+            "opencode-serve: removal failed; check the install root, unit ownership, and systemctl --user status opencode-serve.service",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def guided_install():
     dirty = False
     if not sys.stdin.isatty():
@@ -333,7 +914,7 @@ def guided_install():
         )
         return 1
     try:
-        print("Guided setup. Writes only the install root and the user unit.")
+        print("Guided setup. Writes the install root, user unit, and a per-user operation lock.")
         print(
             "DB is isolated at <root>/data/server.db; provider keys come only"
             " from the refs file. Host logins are not shared."
@@ -355,6 +936,25 @@ def guided_install():
                 break
             except ValueError:
                 print("Port must be 1..65535.")
+        previous = runtime_config(root)
+        use_ts = ask_yes(
+            "Use Tailscale Serve? (yes: loopback + tailnet HTTPS; no: external reverse proxy)",
+            previous.get("use_ts", True),
+        )
+        hostname = "127.0.0.1"
+        if not use_ts:
+            default_host = (
+                previous.get("hostname") if previous.get("use_ts", True) is False else None
+            )
+            while True:
+                try:
+                    hostname = network_settings(
+                        False, ask("Bind IP for proxy access", default_host or "0.0.0.0")
+                    )
+                    break
+                except ValueError:
+                    print("Enter a valid IPv4 or IPv6 bind address.")
+            print("Use HTTPS at your proxy and restrict backend access to the proxy's addresses.")
         binary = ask("opencode binary", default_opencode())
         default_ref = default_secrets()
         if default_ref.exists():
@@ -383,97 +983,117 @@ def guided_install():
                     )
             except (OSError, ValueError):
                 pass
+        password = ask_password()
         names = ", ".join(sorted(refs)) if refs else ("(kept)" if keep else "(none)")
-        print(f"Root: {root}\nPort: {port}\nBinary: {binary}\nRefs: {ref_shown}\nSecrets: {names}")
+        print(
+            f"Root: {root}\nBind: {hostname}:{port}\nTailscale: {use_ts}\nBinary: {binary}\nRefs: {ref_shown}\nSecrets: {names}"
+        )
         if not ask_yes("Write files?", True):
             print("Cancelled; nothing changed.")
             return 1
-        try:
-            if binary and not Path(binary).exists() and not shutil.which(binary):
-                print("opencode binary not found; check the path.", file=sys.stderr)
-                return 1
-            do_install(root, refs, binary, port, keep_env=keep)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            print(
-                "opencode-serve: failed; check inputs, private-file permissions and CLI availability",
-                file=sys.stderr,
-            )
-            return 1
-        dirty = True  # files + unit written
-        print("Installed opencode-serve.service; not started yet.")
-        running = verified = False
-        if ask_yes(
-            "Start/restart service now? (daemon-reload, then enable --now; restarts the unit on reinstall)",
-            True,
-        ):
-            reloaded = cmd(["systemctl", "--user", "daemon-reload"])
-            if reloaded is None or reloaded.returncode:
+        with operation_lock():
+            try:
+                if binary and not Path(binary).exists() and not shutil.which(binary):
+                    print("opencode binary not found; check the path.", file=sys.stderr)
+                    return 1
+                do_install(
+                    root,
+                    refs,
+                    binary,
+                    port,
+                    keep_env=keep,
+                    password=password,
+                    use_ts=use_ts,
+                    hostname=hostname,
+                )
+            except (OSError, ValueError, subprocess.TimeoutExpired):
                 print(
-                    "systemctl daemon-reload failed; run: systemctl --user daemon-reload",
+                    "opencode-serve: failed; check inputs, private-file permissions and CLI availability",
                     file=sys.stderr,
                 )
-            else:
-                active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
-                was_active = active is not None and active.returncode == 0
-                if not was_active and port_listening(port):
-                    # Never proxy or restart over an unrelated listener.
+                return 1
+            dirty = True  # files + unit written
+            print("Installed opencode-serve.service; not started yet.")
+            running = verified = False
+            if ask_yes(
+                "Start/restart service now? (daemon-reload, then enable --now; restarts the unit on reinstall)",
+                True,
+            ):
+                reloaded = cmd(["systemctl", "--user", "daemon-reload"])
+                if reloaded is None or reloaded.returncode:
                     print(
-                        f"Port {port} already answers and the unit is inactive; unrelated"
-                        f" listener suspected. Start skipped; free the port or pick another"
-                        f" port and reinstall.",
+                        "systemctl daemon-reload failed; run: systemctl --user daemon-reload",
                         file=sys.stderr,
                     )
                 else:
-                    verb = ["restart"] if was_active else ["enable", "--now"]
-                    done = cmd(["systemctl", "--user", *verb, "opencode-serve.service"])
-                    if done is None or done.returncode:
+                    active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
+                    was_active = active is not None and active.returncode == 0
+                    if not was_active and port_listening(port, hostname=hostname):
+                        # Never proxy or restart over an unrelated listener.
                         print(
-                            "Service start failed; not exposing via Tailscale."
-                            " Run: systemctl --user status opencode-serve.service",
+                            f"Port {port} already answers and the unit is inactive; unrelated"
+                            f" listener suspected. Start skipped; free the port or pick another"
+                            f" port and reinstall.",
                             file=sys.stderr,
                         )
                     else:
-                        active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
-                        password = service_password(root)
-                        if (
-                            active is not None
-                            and active.returncode == 0
-                            and password
-                            and verify_service(port, password)
-                        ):
-                            running = verified = True
-                        else:
+                        verb = ["restart"] if was_active else ["enable", "--now"]
+                        done = cmd(["systemctl", "--user", *verb, "opencode-serve.service"])
+                        if done is None or done.returncode:
                             print(
-                                "Service start reported success but the unit is not active or"
-                                f" {API_INFO} did not reject bad auth and accept the real password"
-                                f" on 127.0.0.1:{port}; skipping Tailscale."
+                                "Service start failed; not exposing via Tailscale."
                                 " Run: systemctl --user status opencode-serve.service",
                                 file=sys.stderr,
                             )
-        else:
-            active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
-            running = active is not None and active.returncode == 0
-            if running:
-                password = service_password(root)
-                verified = bool(password and verify_service(port, password))
-            print("Skipped service start.")
-        if ask_yes(
-            "Enable linger so the unit survives logout? (loginctl enable-linger, may need permission)",
-            False,
-        ):
-            user = os.environ.get("USER") or Path.home().name
-            lingered = cmd(["loginctl", "enable-linger", user])
-            if lingered is None or lingered.returncode:
-                print(
-                    f"loginctl failed (no sudo attempted); run yourself: loginctl enable-linger {user}",
-                    file=sys.stderr,
-                )
-        if verified:
+                        else:
+                            active = cmd(
+                                ["systemctl", "--user", "is-active", "opencode-serve.service"]
+                            )
+                            password = service_password(root)
+                            if (
+                                active is not None
+                                and active.returncode == 0
+                                and password
+                                and verify_service(port, password, hostname=hostname)
+                            ):
+                                running = verified = True
+                            else:
+                                print(
+                                    "Service start reported success but the unit is not active or"
+                                    f" {API_INFO} did not reject bad auth and accept the real password"
+                                    f" on {probe_hostname(hostname)}:{port}; skipping exposure."
+                                    " Run: systemctl --user status opencode-serve.service",
+                                    file=sys.stderr,
+                                )
+            else:
+                active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
+                running = active is not None and active.returncode == 0
+                if running:
+                    password = service_password(root)
+                    old_hostname = network_settings(
+                        previous.get("use_ts", True), previous.get("hostname")
+                    )
+                    if old_hostname != hostname or previous.get("port", DEFAULT_PORT) != port:
+                        print(
+                            "Networking changed; restart the service before using the new listener."
+                        )
+                    else:
+                        verified = bool(
+                            password and verify_service(port, password, hostname=hostname)
+                        )
+                print("Skipped service start.")
             if ask_yes(
-                "Expose on tailnet via Tailscale Serve? (tailnet-only HTTPS;"
-                " anyone with tailnet access plus password gets full coding access)",
+                "Enable linger so the unit survives logout? (loginctl enable-linger, may need permission)",
                 False,
             ):
+                user = os.environ.get("USER") or Path.home().name
+                lingered = cmd(["loginctl", "enable-linger", user])
+                if lingered is None or lingered.returncode:
+                    print(
+                        f"loginctl failed (no sudo attempted); run yourself: loginctl enable-linger {user}",
+                        file=sys.stderr,
+                    )
+            if use_ts and verified:
                 if not shutil.which("tailscale"):
                     print("tailscale not found; install it first.", file=sys.stderr)
                 else:
@@ -515,9 +1135,7 @@ def guided_install():
                             except ValueError:
                                 cfg = "invalid"
                             if cfg in (None, {}):
-                                exposed = cmd(
-                                    ["tailscale", "serve", "--bg", f"http://127.0.0.1:{port}"]
-                                )
+                                exposed = create_serve(root, dns, port)
                                 if exposed is None or exposed.returncode:
                                     if denied(exposed):
                                         print(
@@ -536,6 +1154,13 @@ def guided_install():
                                 else:
                                     print(f"Serving at https://{dns}")
                             elif cfg != "invalid" and serve_matches(cfg, dns, port):
+                                owned = runtime_config(root).get("tailscale_serve", {})
+                                if (
+                                    owned.get("pending")
+                                    and owned.get("dns") == dns
+                                    and owned.get("port") == port
+                                ):
+                                    record_serve(root, dns, port)
                                 print(f"Already serving at https://{dns}; nothing changed.")
                             else:
                                 print(
@@ -544,17 +1169,23 @@ def guided_install():
                                     file=sys.stderr,
                                 )
                                 # ponytail: no raw-config merge; add only for an explicit --force path.
-        else:
-            if running:
-                print("Service running but endpoint not verified; skipping Tailscale exposure.")
+            elif not use_ts:
+                upstream = "<server LAN IP>" if hostname in ("0.0.0.0", "::") else hostname
+                if ":" in upstream:
+                    upstream = f"[{upstream}]"
+                print(f"Tailscale disabled. Proxy upstream: http://{upstream}:{port}")
             else:
-                print("Service not running; skipping Tailscale exposure.")
-        print("Password stays private. As user `opencode`, get it with:")
-        print(
-            f"  python3 -c \"import json;print(json.load(open('{root}/config/opencode/service.json'))['password'])\""
-        )
-        print("Serve state: tailscale serve status")
-        return 0
+                if running:
+                    print("Service running but endpoint not verified; skipping Tailscale exposure.")
+                else:
+                    print("Service not running; skipping Tailscale exposure.")
+            print("Password stays private. As user `opencode`, get it with:")
+            print(
+                f"  python3 -c \"import json;print(json.load(open('{root}/config/opencode/service.json'))['password'])\""
+            )
+            if use_ts:
+                print("Serve state: tailscale serve status")
+            return 0
     except _Cancel:
         return cancelled(dirty)
     except KeyboardInterrupt:
@@ -565,6 +1196,7 @@ def guided_install():
 def run(root):
     config = json.loads((root / "runtime.json").read_text())
     port = port_value(config.get("port", 4096))
+    hostname = network_settings(config.get("use_ts", True), config.get("hostname"))
     password = service_password(root)
     if not password:
         raise ValueError("server password missing; refusing unauthenticated startup")
@@ -595,7 +1227,7 @@ def run(root):
                     "serve",
                     "--service",
                     "--hostname",
-                    "127.0.0.1",
+                    hostname,
                     "--port",
                     str(port),
                 ],
@@ -607,11 +1239,32 @@ def run(root):
 
 
 def main():
+    if sys.argv[1:2] == ["completion"]:
+        return completion_main(sys.argv[2:])
+    if sys.argv[1:2] == ["remove"]:
+        return remove_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["install", "run"])
+    parser.add_argument("action", choices=["install", "run", "completion", "remove"])
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--secrets", type=Path, default=None)
     parser.add_argument("--opencode", default=None)
+    parser.add_argument(
+        "--use-ts",
+        choices=("true", "false"),
+        default=None,
+        help="install networking: true = Tailscale/loopback, false = external proxy",
+    )
+    parser.add_argument(
+        "--hostname",
+        default=None,
+        help="install bind IP (default: 127.0.0.1 with Tailscale, 0.0.0.0 without)",
+    )
+    parser.add_argument(
+        "--password",
+        "--pasword",
+        default=None,
+        help="install-time server password; replaces an existing password (default: keep or generate)",
+    )
     parser.add_argument(
         "--port",
         type=port_value,
@@ -619,8 +1272,16 @@ def main():
         help="install-time listen port, 1..65535 (run uses runtime.json)",
     )
     args = parser.parse_args()
+    if args.action in ("completion", "remove"):
+        parser.error("use completion or remove as the first argument")
+    args.use_ts = None if args.use_ts is None else args.use_ts == "true"
+    if args.action == "run" and (args.use_ts is not None or args.hostname is not None):
+        parser.error("--use-ts and --hostname are install-time options; run uses runtime.json")
+    if args.action == "run" and args.password is not None:
+        parser.error("--password is only supported for install")
     if args.action == "install" and any(
-        getattr(args, name) is not None for name in ("root", "secrets", "opencode", "port")
+        getattr(args, name) is not None
+        for name in ("root", "secrets", "opencode", "port", "password", "use_ts", "hostname")
     ):
         try:
             os.umask(0o077)

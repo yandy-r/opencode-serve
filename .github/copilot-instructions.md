@@ -8,8 +8,10 @@ PR-workflow essentials re-stated for agents that land here first.
 ## Project
 
 Python stdlib-only installer/launcher for an isolated OpenCode foreground
-server (`opencode serve --service`) as a systemd user unit on 127.0.0.1,
-with guided Tailscale Serve exposure and 1Password secret refs. Two source
+server (`opencode serve --service`) as a systemd user unit: loopback with
+optional Tailscale Serve, or a configurable bind IP for an external proxy.
+Supports uninstall with data retention or explicit purge, and 1Password
+secret refs. Two source
 files: `serve.py`, `test_serve.py`. No runtime dependencies. No build step.
 
 Commands: `python3 test_serve.py` (must end `result: ALL PASS`),
@@ -28,7 +30,7 @@ PR titles are validated by
 [`.github/workflows/pr-title.yml`](workflows/pr-title.yml) and the check is
 required to merge. Use:
 
-```
+```text
 <type>[optional scope]: <description>
 ```
 
@@ -45,7 +47,7 @@ required to merge. Use:
 
 Edit the existing PR in place — **do not open a replacement PR**:
 
-```
+```text
 gh pr edit <number> --title "<new-title>"
 ```
 

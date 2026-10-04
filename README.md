@@ -1,9 +1,39 @@
 # opencode-serve
 
 Repeatable Linux systemd-user foreground `opencode serve --service` on
-127.0.0.1:4096 (customizable), plus manual or guided Tailscale Serve. Python
+127.0.0.1:4096 by default, with optional Tailscale Serve or a listener for an
+external reverse proxy. Python
 stdlib only (`serve.py`, `test_serve.py`). Nothing runs except on explicit
 execution.
+
+## Shell completions
+
+Install completions for the shell named by `$SHELL`:
+
+```sh
+./serve.py completion --install --force
+```
+
+Use `completion bash`, `completion zsh`, or `completion fish` to select a shell
+explicitly. Add `--install` to install for that shell; without it, the command
+prints the completion script. `--force` replaces an existing completion file;
+without it, installation refuses to overwrite one.
+
+Completions work with direct invocation (`./serve.py`, `/path/to/serve.py`, or
+`serve.py` on your `PATH`). They complete actions, flags, shell names, and file
+or directory arguments. Password and port values have no suggestions. Invoking
+the script through `python3 serve.py` uses Python's shell completion instead.
+
+Bash and Zsh scripts are installed under
+`${XDG_DATA_HOME:-~/.local/share}/opencode-serve/completions/`, with a managed
+source block added to `~/.bashrc` or `${ZDOTDIR:-~}/.zshrc`. Existing shell config
+text and file mode are preserved, and reinstalling updates that block without
+duplicating it. Config files are replaced atomically; hardlinks and extended
+metadata are not retained.
+Fish loads `${XDG_CONFIG_HOME:-~/.config}/fish/conf.d/opencode-serve.fish` at
+startup, which also enables completion for `./serve.py` outside `PATH`, and
+needs no edits to `config.fish`. Open a new shell after installation. The command installs
+only user completions; it does not install or start the server.
 
 ## Auth notes (opencode v2.0.22)
 
@@ -13,8 +43,9 @@ execution.
 - Serve stdout/stderr is suppressed in `run()` because the server can print
   password material; journald stays clean by design. Debug via exit codes and a
   temp-HOME reproduction, not by re-enabling output.
-- Fixed password generated once (`secrets.token_urlsafe(32)`), preserved on
-  reinstall. Fetched secret values are stored verbatim JSON 0600, never
+- Password generated once (`secrets.token_urlsafe(32)`) unless you supply one,
+  preserved on reinstall unless you explicitly set a replacement. Fetched
+  secret values and passwords are stored verbatim JSON 0600, never
   interpolated.
 
 ## Quick start (guided, one command)
@@ -28,6 +59,11 @@ execution.
    - **Install root** (default `~/.local/share/opencode-serve`). Relative
      paths resolve against your current directory, not the install root.
    - **Port** (default 4096; an existing install reuses its saved port).
+   - **Use Tailscale Serve?** — yes keeps the listener on `127.0.0.1` and
+     configures tailnet HTTPS after a successful service/authentication check.
+     No skips Tailscale and asks for a **Bind IP** (default `0.0.0.0`, or a
+     specific private IPv4/IPv6 address for a proxy on another machine).
+     Reinstallation defaults to the saved networking choice and bind address.
    - **opencode binary** (default `~/.opencode/bin/opencode`).
    - **Refs file** — 1Password `op://` references for provider keys
      (`{"ENV_NAME": "op://vault/item/field", ...}`). Empty answer means no
@@ -35,12 +71,15 @@ execution.
      resolve against your current directory. An existing install keeps its
      saved secret values when you answer empty (nothing is erased silently);
      naming a file replaces the set.
+   - **Server password** — hidden input with confirmation. Enter keeps the
+     existing password or generates one for a new install. Supplying a password
+     replaces the existing password; spaces and special characters are preserved.
    - A summary before anything is written; Ctrl-C, EOF, or `n` cancels with
      zero changes. Cancel/EOF are safe at every prompt.
 3. If you accept, it writes files, then offers: `systemctl --user
 daemon-reload` + `enable --now` (or an explicit restart on reinstall),
    optional `loginctl enable-linger` (run yourself if it needs permission; the
-   installer never uses sudo), and optional Tailscale Serve exposure
+   installer never uses sudo), and Tailscale Serve exposure when selected
    (tailnet-only HTTPS via `tailscale serve --bg http://127.0.0.1:PORT`). If
    Serve is root-managed, a failed `serve` prints only the matching `sudo`
    recovery command (never run by the installer); `sudo tailscale set
@@ -65,25 +104,99 @@ line instead of hanging or changing services.
 
 ## Automated path (explicit flags — noninteractive)
 
-`python3 serve.py install --root DIR --secrets FILE --opencode PATH --port PORT`
+`python3 serve.py install --root DIR --secrets FILE --opencode PATH --port PORT --password PASSWORD --use-ts true`
 (any subset; passing any flag selects this mode). It only installs, exactly as
 before:
+
+`--password` (alias `--pasword`) sets or replaces the server password. It must
+be nonempty and contain no NUL characters. Omit it to keep the existing password
+or generate one for a new install. Command-line passwords can appear in shell
+history and process listings; use the guided hidden prompt when entering one
+manually. The option is only accepted for `install`.
+
+`--use-ts {true|false}` selects the networking mode. True uses `127.0.0.1`;
+false defaults to `0.0.0.0`. With false, `--hostname IP` selects a specific
+IPv4/IPv6 bind address. Omitted networking options retain the previous settings;
+new and legacy installs default to Tailscale/loopback. Explicit-flag installation
+does not start the unit or create a Serve mapping; start the unit and configure
+Tailscale Serve manually when selected. It can remove an existing managed
+mapping when networking changes. Saved binary and port settings are also kept
+when their flags are omitted. `run` reads the saved settings and does not accept
+these networking flags.
 
 1. Refs file `{"ENV_NAME": "op://vault/item/field", ...}`. Reserved names:
    `HOME PATH OP_SERVICE_ACCOUNT_TOKEN OPENCODE_DB OPENCODE_PASSWORD
 OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
    `OPENCODE_SERVE_`, or `_`. Relative `--secrets` paths resolve against the
    current directory, independent of `--root`.
-2. Writes only `<root>/` (`config/ data/ state/ cache/ runtime.json serve.py`,
+2. Writes `<root>/` (`config/ data/ state/ cache/ runtime.json serve.py`,
    password `config/opencode/service.json`) and the unit
    `~/.config/systemd/user/opencode-serve.service`. Unit names are fixed;
-   rerun install after moving root. Fails closed: any fetch/validation error
+   rerun install after moving root. First installation requires an empty,
+   dedicated root; unrelated nonempty directories are refused. Operations on
+   the shared unit and Serve configuration are serialized by a private lock at
+   `~/.local/state/opencode-serve/operation.lock`. Fails closed: any fetch/validation error
    aborts before replacing working files. Secret values already fetched in
    `runtime.json` are replaced only when a refs file is given.
 3. `systemctl --user daemon-reload && systemctl --user enable --now opencode-serve.service`
-4. Password retrieval as above. To rotate: stop the unit, remove the password
-   file, rerun the installer with your original options, then start the unit.
+4. Password retrieval as above. To rotate: stop the unit, rerun the installer
+   with `--password PASSWORD` (or enter a new password in guided setup), then
+   start the unit. To generate a fresh random password, stop the unit, remove
+   the password file, rerun the installer with your original options, then start
+   the unit.
 5. Linger (else unit dies at logout): `loginctl enable-linger $USER`.
+
+## External proxy (Traefik, F5, or similar)
+
+```sh
+./serve.py install --use-ts false --hostname 192.168.1.20 --port 4096
+systemctl --user daemon-reload
+systemctl --user enable --now opencode-serve.service
+# On an already running installation, apply changed settings with:
+systemctl --user restart opencode-serve.service
+```
+
+Use an IP assigned to the OpenCode machine. Configure the remote proxy's
+upstream as `http://192.168.1.20:4096` (IPv6 example: `http://[fd00::20]:4096`).
+Omit `--hostname` to listen on all IPv4 interfaces. Terminate client HTTPS at
+the proxy, preserve the Authorization header and streaming connections, and
+restrict backend access to the proxy with your firewall. OpenCode's Basic
+authentication still uses user `opencode` and the saved server password.
+There is no Tailscale dependency for a new installation in this mode.
+
+Changing the bind address or networking mode requires restarting the service.
+If guided setup skips that restart, it does not expose changed settings through
+Tailscale. Disabling Tailscale or changing the port removes an exact Serve
+mapping previously created by guided setup; if that mapping has become shared
+or cannot be inspected, the networking change fails so you can resolve it
+manually. Untracked/manual Serve routes are preserved.
+
+## Remove / uninstall
+
+```sh
+./serve.py remove --root ~/.local/share/opencode-serve
+./serve.py remove --root ~/.local/share/opencode-serve --purge
+```
+
+The root defaults to `~/.local/share/opencode-serve`. Removal verifies unit
+ownership, disables/stops the user service, confirms it is inactive, removes
+the unit, and reloads systemd. It then removes the copied launcher while keeping
+the database, `runtime.json` (including saved provider credentials), password,
+and remaining config/state/cache files. Reinstall with your original options
+to use the retained data. `--purge` deletes the complete installation directory,
+including credentials and database; it also works after a prior removal.
+Purge refuses to discard a managed or pending Serve recovery record until
+cleanup is verified. Resolve the reported Serve state and retry removal.
+Home/shared config directories, unrecognized roots, and root symlinks are
+refused. Bridged host-config symlinks are never followed during deletion.
+
+Removal disables a tracked Tailscale Serve mapping only when the entire current
+Serve config matches that installation's endpoint. Shared, modified, manual,
+or inaccessible Serve config is retained with a notice when tracked; inspect
+`tailscale serve status` and clean up manually if needed. Removal does not
+uninstall the OpenCode/Tailscale binaries, revoke user linger, remove shell
+completions, or delete host OpenCode settings. The shared operation lock remains
+so other installation roots keep using the same coordinator.
 
 ## Tailscale Serve (manual — inspect first, never overwrite blindly)
 
@@ -104,7 +217,9 @@ Keep ACLs tight, rotate often.
 
 ## Layout
 
-- `serve.py` — installer + launcher (`install` guided or flagged / `run`).
+- `serve.py` — installer + launcher (`install` guided or flagged / `run`),
+  uninstaller (`remove`, optional `--purge`), plus
+  shell completion generation and installation (`completion`).
 - `opencode-serve.service.in` — unit template (`@EXEC@` quoted for
   spaces/`%`/`$`; `Type=simple`, `Restart=on-failure`, `UMask=0077`,
   `PrivateTmp=yes` hardening — needs real HOME/XDG/network).
@@ -116,6 +231,8 @@ Keep ACLs tight, rotate often.
   preservation, failed start skips exposure, idempotent vs conflicting Serve
   state, external failures, explicit-flag parity) using mocked
   systemctl/tailscale/loginctl only.
+  Networking checks also use a temporary authenticated HTTP listener on
+  `127.0.0.2` to verify probes of a selected bind address.
 - `.gitignore` ignores `.opencode-serve.local/`, `*.log`, `__pycache__/`.
 
 ## Verified limits
