@@ -135,6 +135,7 @@ def do_run(mod, base, root, extra_env=None):
 
 
 def main():
+    os.makedirs("/tmp/opencode", exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="oc-serve-test-", dir="/tmp/opencode") as tmp:
         base = Path(tmp)
         home = make_fake_home(base)
