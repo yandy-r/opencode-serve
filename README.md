@@ -107,7 +107,7 @@ line instead of hanging or changing services.
 
 ## Automated path (explicit flags — noninteractive)
 
-`python3 serve.py install --root DIR --secrets FILE --opencode PATH --port PORT --password PASSWORD --use-ts true`
+`python3 serve.py install --root DIR --secrets FILE --opencode PATH --port PORT --password PASSWORD --use-ts true --cors ORIGIN`
 (any subset; passing any flag selects this mode). It only installs, exactly as
 before:
 
@@ -124,8 +124,19 @@ new and legacy installs default to Tailscale/loopback. Explicit-flag installatio
 does not start the unit or create a Serve mapping; start the unit and configure
 Tailscale Serve manually when selected. It can remove an existing managed
 mapping when networking changes. Saved binary and port settings are also kept
-when their flags are omitted. `run` reads the saved settings and does not accept
-these networking flags.
+when their flags are omitted. `run` reads the saved settings and does not
+accept these networking flags.
+
+`--cors ORIGIN` allows other OpenCode web UI origins for multi-server
+management. Example: `python3 serve.py install --root DIR --cors https://app.example`.
+Repeat the flag or pass a comma-separated list
+(`--cors "https://a.example,https://b.example"`) to store several; `--cors ''`
+clears them. Origins must use HTTP or HTTPS with no path, query, fragment, or
+trailing slash. Rerun install to update in place: password, service.json,
+symlinks, and data stay intact. Omitting the flag keeps previously saved
+origins; the launcher forwards one
+`--cors <origin>` pair per stored origin to `opencode serve`. Install-time
+only; `run` reads the saved settings. Guided setup prompts for the same list.
 
 1. Refs file `{"ENV_NAME": "op://vault/item/field", ...}`. Reserved names:
    `HOME PATH OP_SERVICE_ACCOUNT_TOKEN OPENCODE_DB OPENCODE_PASSWORD

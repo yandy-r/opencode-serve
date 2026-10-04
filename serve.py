@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import warnings
 from pathlib import Path
 
@@ -46,7 +47,7 @@ _opencode_serve() {
     action=${COMP_WORDS[1]}
     COMPREPLY=()
     case "$prev" in
-        --password|--pasword|--port|--hostname) return ;;
+        --password|--pasword|--port|--hostname|--cors) return ;;
         --use-ts)
             while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -W 'true false' -- "$cur")
             return ;;
@@ -69,7 +70,7 @@ _opencode_serve() {
     esac
     options='--help -h'
     case "$action" in
-        install) options+=' --root --secrets --opencode --port --password --pasword --use-ts --hostname' ;;
+        install) options+=' --root --secrets --opencode --port --password --pasword --use-ts --hostname --cors' ;;
         run) options+=' --root' ;;
         remove) options+=' --root --purge' ;;
         completion) options+=' bash zsh fish --install --force' ;;
@@ -99,6 +100,7 @@ _opencode_serve() {
                         '--port[Listen port]:port:' \
                         '--use-ts[Use Tailscale networking]:boolean:(true false)' \
                         '--hostname[Bind IP for external proxy]:IP address:' \
+                        '*--cors[Allowed browser origin]:origin:' \
                         '(--password --pasword)'{--password,--pasword}'[Set server password]:password:' \
                         '(-h --help)'{-h,--help}'[Show help]' ;;
                 run)
@@ -128,6 +130,7 @@ complete -c serve.py -n '__fish_seen_subcommand_from install' -l opencode -r -F 
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l port -x -d 'Listen port'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l use-ts -x -a 'true false' -d 'Use Tailscale networking'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l hostname -x -d 'Bind IP for external proxy'
+complete -c serve.py -n '__fish_seen_subcommand_from install' -l cors -x -d 'Allowed browser origin (repeatable)'
 complete -c serve.py -n '__fish_seen_subcommand_from remove' -l purge -d 'Delete installation data and credentials'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l password -x -d 'Set server password'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l pasword -x -d 'Set server password'
@@ -284,6 +287,26 @@ def port_value(raw):
     return port
 
 
+def cors_value(origin):
+    if not isinstance(origin, str) or any(c.isspace() or ord(c) < 32 for c in origin):
+        raise ValueError("cors origin must be scheme://host[:port], no path")
+    parsed = urllib.parse.urlsplit(origin)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.netloc.endswith(":")
+        or parsed.username is not None
+        or parsed.path
+        or "?" in origin
+        or "#" in origin
+        or (parsed.port is not None and not 1 <= parsed.port <= 65535)
+    ):
+        raise ValueError("cors origin must be scheme://host[:port], no path")
+    # ponytail: normalize to browser-Origin form (lowercase scheme+host); opencode CORS matcher compares exact strings
+    return f"{parsed.scheme}://{parsed.netloc.lower()}"
+
+
 def executable(name):
     path = shutil.which(name)
     if not path:
@@ -391,8 +414,18 @@ def validated_refs(refs):
 
 
 def do_install(
-    root, refs, binary_name, port, keep_env=None, password=None, use_ts=None, hostname=None
+    root,
+    refs,
+    binary_name,
+    port,
+    keep_env=None,
+    password=None,
+    use_ts=None,
+    hostname=None,
+    cors=None,
 ):
+    if cors is not None:
+        cors = [cors_value(origin) for origin in cors]
     if password is not None and (not isinstance(password, str) or not password or "\0" in password):
         raise ValueError("password must be a nonempty string without NUL")
     root = Path(root).absolute()
@@ -423,6 +456,7 @@ def do_install(
         # One writer; fetch all values before replacing any working runtime files.
         with file_lock(root / ".install.lock"):
             previous = runtime_config(root)
+            cors = previous.get("cors_origins", []) if cors is None else cors
             old_mode = previous.get("use_ts", True)
             use_ts = old_mode if use_ts is None else use_ts
             if hostname is None and use_ts == old_mode:
@@ -493,6 +527,7 @@ def do_install(
                 "hostname": hostname,
                 "use_ts": use_ts,
                 "install_root": str(root),
+                "cors_origins": cors,
             }
             if owned_serve:
                 config["tailscale_serve"] = owned_serve
@@ -524,6 +559,16 @@ def install(args):
                     keep = saved_env
             except (OSError, ValueError):
                 pass
+        parsed_cors = (
+            previous.get("cors_origins", [])
+            if args.cors is None
+            else [
+                cors_value(origin.strip())
+                for entry in args.cors
+                for origin in entry.split(",")
+                if origin.strip()
+            ]
+        )
         do_install(
             root,
             refs,
@@ -533,6 +578,7 @@ def install(args):
             password=args.password,
             use_ts=args.use_ts,
             hostname=args.hostname,
+            cors=parsed_cors,
         )
 
 
@@ -941,6 +987,18 @@ def guided_install():
                 except ValueError:
                     print("Enter a valid IPv4 or IPv6 bind address.")
             print("Use HTTPS at your proxy and restrict backend access to the proxy's addresses.")
+        saved_cors = previous.get("cors_origins", [])
+        cors_default = ", ".join(saved_cors)
+        while True:
+            raw_cors = ask("Allowed browser origins (comma-separated)", cors_default)
+            if not raw_cors:
+                cors = saved_cors
+                break
+            try:
+                cors = [cors_value(part.strip()) for part in raw_cors.split(",") if part.strip()]
+                break
+            except ValueError:
+                print("Origins must be scheme://host[:port], no path.")
         binary = ask("opencode binary", default_opencode())
         default_ref = default_secrets()
         if default_ref.exists():
@@ -971,8 +1029,9 @@ def guided_install():
                 pass
         password = ask_password()
         names = ", ".join(sorted(refs)) if refs else ("(kept)" if keep else "(none)")
+        origins = ", ".join(cors) if cors else "(none)"
         print(
-            f"Root: {root}\nBind: {hostname}:{port}\nTailscale: {use_ts}\nBinary: {binary}\nRefs: {ref_shown}\nSecrets: {names}"
+            f"Root: {root}\nBind: {hostname}:{port}\nTailscale: {use_ts}\nBinary: {binary}\nRefs: {ref_shown}\nSecrets: {names}\nOrigins: {origins}"
         )
         if not ask_yes("Write files?", True):
             print("Cancelled; nothing changed.")
@@ -991,6 +1050,7 @@ def guided_install():
                     password=password,
                     use_ts=use_ts,
                     hostname=hostname,
+                    cors=cors,
                 )
             except RootRefusal as error:
                 # Message is built only from escaped root/entry names; no exception text.
@@ -1210,19 +1270,18 @@ def run(root):
             os.dup2(sink.fileno(), 2)
             os.umask(0o077)
             os.chdir(config["home"])
-            os.execve(
+            argv = [
                 config["binary"],
-                [
-                    config["binary"],
-                    "serve",
-                    "--service",
-                    "--hostname",
-                    hostname,
-                    "--port",
-                    str(port),
-                ],
-                env,
-            )
+                "serve",
+                "--service",
+                "--hostname",
+                hostname,
+                "--port",
+                str(port),
+            ]
+            for origin in config.get("cors_origins", []):
+                argv += ["--cors", origin]
+            os.execve(config["binary"], argv, env)
         finally:
             os.dup2(saved_err, 2)
             os.close(saved_err)
@@ -1261,6 +1320,12 @@ def main():
         default=None,
         help="install-time listen port, 1..65535 (run uses runtime.json)",
     )
+    parser.add_argument(
+        "--cors",
+        action="append",
+        metavar="ORIGIN",
+        help="install allowed browser origin (repeatable or comma-separated; omit to keep)",
+    )
     args = parser.parse_args()
     if args.action in ("completion", "remove"):
         parser.error("use completion or remove as the first argument")
@@ -1269,9 +1334,20 @@ def main():
         parser.error("--use-ts and --hostname are install-time options; run uses runtime.json")
     if args.action == "run" and args.password is not None:
         parser.error("--password is only supported for install")
+    if args.action == "run" and args.cors is not None:
+        parser.error("--cors is only supported for install")
     if args.action == "install" and any(
         getattr(args, name) is not None
-        for name in ("root", "secrets", "opencode", "port", "password", "use_ts", "hostname")
+        for name in (
+            "root",
+            "secrets",
+            "opencode",
+            "port",
+            "password",
+            "use_ts",
+            "hostname",
+            "cors",
+        )
     ):
         try:
             os.umask(0o077)

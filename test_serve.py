@@ -485,10 +485,138 @@ def main():
         guided_checks(load(), base, home, bindir)
         completion_checks(load(), base)
         network_checks(load(), base, home, bindir)
+        cors_checks(load(), base, home, bindir)
         remove_checks(load(), base, home, bindir)
         tailscale_cleanup_checks(load(), base, home, bindir)
     print("result:", "ALL PASS" if not failures else f"FAILURES {failures}")
     return 1 if failures else 0
+
+
+def cors_checks(mod, base, home, bindir):
+    root = base / "cors"
+    origins = ["https://a.example", "https://b.example"]
+    installed = do_install(
+        mod,
+        base,
+        home,
+        bindir,
+        {},
+        root,
+        ("--port", "5123", "--cors", origins[0], "--cors", origins[1]),
+    )
+    runtime = root / "runtime.json"
+    check(
+        "repeatable cors persisted",
+        installed.returncode == 0 and json.loads(runtime.read_text())["cors_origins"] == origins,
+    )
+    service = root / "config/opencode/service.json"
+    password_file = service.read_bytes()
+    bridge = root / "config/opencode/opencode.json"
+    bridge_target = bridge.readlink()
+    data = root / "data/server.db"
+    data.write_bytes(b"preserved database")
+    config = json.loads(runtime.read_text())
+    config["binary"] = str(base / "runbin/opencode")
+    runtime.write_text(json.dumps(config))
+    launched, probe = do_run(mod, base, root)
+    check(
+        "run forwards cors in stored order",
+        launched.returncode == 0
+        and json.loads(probe.read_text())["argv"][1:]
+        == [
+            "serve",
+            "--service",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "5123",
+            "--cors",
+            origins[0],
+            "--cors",
+            origins[1],
+        ],
+    )
+    env = dict(os.environ, HOME=str(home), PATH=str(bindir), XDG_CONFIG_HOME=str(home / ".config"))
+
+    def update(*flags):
+        return subprocess.run(
+            [sys.executable, str(REPO / "serve.py"), "install", "--root", str(root), *flags],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    repeated = update()
+    check(
+        "cors omitted preserves origins and installation in place",
+        repeated.returncode == 0
+        and json.loads(runtime.read_text())["cors_origins"] == origins
+        and service.read_bytes() == password_file
+        and bridge.is_symlink()
+        and bridge.readlink() == bridge_target
+        and data.read_bytes() == b"preserved database",
+    )
+    replaced = update("--cors", "https://new.example")
+    check(
+        "cors replaces previous origins",
+        replaced.returncode == 0
+        and json.loads(runtime.read_text())["cors_origins"] == ["https://new.example"],
+    )
+    split = update("--cors", " https://a.example, ,https://b.example ")
+    check(
+        "cors comma split strips whitespace and drops empties",
+        split.returncode == 0 and json.loads(runtime.read_text())["cors_origins"] == origins,
+    )
+    saved = runtime.read_bytes()
+    rejected = update("--cors", "https://x/a")
+    check(
+        "invalid cors preserves existing runtime",
+        rejected.returncode != 0 and runtime.read_bytes() == saved,
+    )
+    cleared = update("--cors", "")
+    check(
+        "empty cors clears origins",
+        cleared.returncode == 0 and json.loads(runtime.read_text())["cors_origins"] == [],
+    )
+    for origin in ("https://x/a", "ftp://x", "https://x/", "https://x?query", "https://x#fragment"):
+        invalid_root = base / "invalid-cors"
+        rejected = do_install(mod, base, home, bindir, {}, invalid_root, ("--cors", origin))
+        check(
+            "invalid cors rejected before runtime write",
+            rejected.returncode != 0 and not (invalid_root / "runtime.json").exists(),
+        )
+    config = json.loads(runtime.read_text())
+    config.pop("cors_origins")
+    config.pop("install_root")
+    runtime.write_text(json.dumps(config))
+    launched, probe = do_run(mod, base, root)
+    check(
+        "legacy runtime launches without cors",
+        launched.returncode == 0
+        and json.loads(probe.read_text())["argv"][1:]
+        == [
+            "serve",
+            "--service",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "5123",
+        ],
+    )
+    repeated = update()
+    check(
+        "legacy installation remains recognized",
+        repeated.returncode == 0 and json.loads(runtime.read_text())["cors_origins"] == [],
+    )
+    rejected = subprocess.run(
+        [sys.executable, str(REPO / "serve.py"), "run", "--cors", origins[0]],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    check("run rejects install-only cors", rejected.returncode == 2)
 
 
 def network_checks(mod, base, home, bindir):
@@ -1417,6 +1545,7 @@ def guided_setup(
     active_ok=True,
     password_answers=None,
     network_answers=None,
+    cors_answers=None,
 ):
     import builtins
 
@@ -1440,6 +1569,7 @@ def guided_setup(
     orig_record = mod.record_serve
     network_replies = iter(["y"] if network_answers is None else network_answers)
     password_replies = iter([""] if password_answers is None else password_answers)
+    cors_replies = iter([""] if cors_answers is None else cors_answers)
 
     def fake_getpass(prompt=""):
         sys.stdout.write(prompt)
@@ -1462,6 +1592,12 @@ def guided_setup(
         sys.stdout.write(prompt)
         if prompt.startswith(("Use Tailscale Serve?", "Bind IP for proxy access")):
             reply = next(network_replies)
+            if isinstance(reply, BaseException):
+                raise reply
+            print(reply)
+            return reply
+        if prompt.startswith("Allowed browser origins"):
+            reply = next(cors_replies)
             if isinstance(reply, BaseException):
                 raise reply
             print(reply)
@@ -1520,7 +1656,15 @@ def guided_setup(
         return subprocess.CompletedProcess(argv, 1, b"", b"")
 
     def fake_install(
-        root, refs, binary_name, port, keep_env=None, password=None, use_ts=None, hostname=None
+        root,
+        refs,
+        binary_name,
+        port,
+        keep_env=None,
+        password=None,
+        use_ts=None,
+        hostname=None,
+        cors=None,
     ):
         root.mkdir(parents=True, exist_ok=True)
         mod.atomic(
@@ -1539,6 +1683,7 @@ def guided_setup(
                 "password": password,
                 "use_ts": use_ts,
                 "hostname": hostname,
+                "cors": cors,
             }
         )
 
@@ -1623,8 +1768,11 @@ def _guided_checks(mod, base, home, bindir):
         mod,
         [str(gsrv), "5123", str(bindir / "opencode"), str(sec), "y", "y", "n", "y"],
         ready="good",
+        cors_answers=["https://invalid.example/path", " HTTPS://A.example, ,https://b.example "],
     )
-    rc = mod.guided_install()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = mod.guided_install()
     guided_teardown(mod, saved, st, origs)
     bg = [c for c in st["cmds"] if c[:2] == ["tailscale", "serve"] and "--bg" in c]
     check(
@@ -1634,6 +1782,9 @@ def _guided_checks(mod, base, home, bindir):
         and st["installs"][0]["port"] == 5123
         and st["installs"][0]["refs"] == {"K": "op://v/i/k"}
         and st["installs"][0]["password"] is None
+        and st["installs"][0]["cors"] == ["https://a.example", "https://b.example"]
+        and "Origins: https://a.example, https://b.example" in buf.getvalue()
+        and "scheme://host" in buf.getvalue()
         and bg == [["tailscale", "serve", "--bg", "http://127.0.0.1:5123"]],
     )
     for host in ("", "192.0.2.10", "::"):
@@ -1764,6 +1915,7 @@ def _guided_checks(mod, base, home, bindir):
         "guided no refs",
         rc == 0
         and st["installs"][0]["refs"] == {}
+        and st["installs"][0]["cors"] == []
         and not [c for c in st["cmds"] if c[:1] == ["tailscale"]],
     )
 
@@ -1831,6 +1983,25 @@ def _guided_checks(mod, base, home, bindir):
         rc == 0
         and st["installs"][0]["keep"] == {"OLD": "kept"}
         and st["installs"][0]["refs"] == {},
+    )
+
+    cors_root = base / "guided-cors-keep"
+    cors_root.mkdir()
+    (cors_root / "runtime.json").write_text(
+        json.dumps({"port": 4096, "env": {}, "cors_origins": ["https://old.example"]})
+    )
+    saved = guided_env(home)
+    st, origs = guided_setup(mod, [str(cors_root), "", str(bindir / "opencode"), "", "y", "n", "n"])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = mod.guided_install()
+    guided_teardown(mod, saved, st, origs)
+    check(
+        "guided blank keeps saved cors and shows default",
+        rc == 0
+        and st["installs"][0]["cors"] == ["https://old.example"]
+        and "[https://old.example]" in buf.getvalue()
+        and "Origins: https://old.example" in buf.getvalue(),
     )
 
     # failed start -> no tailscale call
