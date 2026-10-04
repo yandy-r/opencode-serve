@@ -1,0 +1,3 @@
+.opencode-serve.local/
+*.log
+__pycache__/

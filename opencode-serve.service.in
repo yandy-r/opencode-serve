@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenCode isolated foreground server (opencode-serve)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=@EXEC@
+Restart=on-failure
+RestartSec=5
+# NoNewPrivileges yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
