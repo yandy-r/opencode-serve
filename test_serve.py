@@ -1446,9 +1446,13 @@ def guided_setup(
         fake_cmd,
         fake_install,
     )
-    mod.shutil.which = lambda name: (
-        None if name == "tailscale" and serve_cfg == "no-tail" else orig_which(name)
-    )
+
+    def fake_which(name):
+        if name != "tailscale":
+            return orig_which(name)
+        return None if serve_cfg == "no-tail" else "/fake/tailscale"
+
+    mod.shutil.which = fake_which
     mod.api_get = fake_api
     mod.time.sleep = lambda s: None
     mod.service_password = lambda root: "pw"
