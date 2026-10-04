@@ -1,3 +1,5 @@
 .opencode-serve.local/
 *.log
 __pycache__/
+.ruff_cache/
+.markdownlintcache

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Install or launch isolated OpenCode foreground server. Python stdlib only."""
+
 import argparse
 import base64
+import contextlib
 import fcntl
 import http.client
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import shutil
@@ -14,10 +15,17 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
-
-RESERVED = {"HOME", "PATH", "OP_SERVICE_ACCOUNT_TOKEN", "OPENCODE_DB",
-            "OPENCODE_PASSWORD", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"}
+RESERVED = {
+    "HOME",
+    "PATH",
+    "OP_SERVICE_ACCOUNT_TOKEN",
+    "OPENCODE_DB",
+    "OPENCODE_PASSWORD",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+}
 
 DEFAULT_PORT = 4096
 
@@ -72,14 +80,18 @@ def quote(value):
     value = str(value)
     if any(ord(c) < 32 for c in value):
         raise ValueError("control character in systemd path")
-    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+    return (
+        '"'
+        + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+        + '"'
+    )
 
 
 def port_value(raw):
     try:
         port = int(raw)
     except (TypeError, ValueError):
-        raise ValueError("port must be 1..65535")
+        raise ValueError("port must be 1..65535") from None
     if not 1 <= port <= 65535:
         raise ValueError("port must be 1..65535")
     return port
@@ -96,10 +108,17 @@ def validated_refs(refs):
     if not isinstance(refs, dict):
         raise ValueError("references must be a JSON object")
     for name, ref in refs.items():
-        if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
-                or name in RESERVED or name.startswith("XDG_") or name.startswith("OPENCODE_SERVE_")
-                or name.startswith("_") or not isinstance(ref, str) or not ref.startswith("op://")
-                or "\0" in ref):
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+            or name in RESERVED
+            or name.startswith("XDG_")
+            or name.startswith("OPENCODE_SERVE_")
+            or name.startswith("_")
+            or not isinstance(ref, str)
+            or not ref.startswith("op://")
+            or "\0" in ref
+        ):
             raise ValueError("invalid or reserved environment reference")
     return refs
 
@@ -122,8 +141,12 @@ def do_install(root, refs, binary_name, port, keep_env=None):
         else:
             fetched = {}
             for name, ref in refs.items():
-                result = subprocess.run([op, "read", "--no-newline", ref],
-                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+                result = subprocess.run(
+                    [op, "read", "--no-newline", ref],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                )
                 if result.returncode:
                     raise ValueError("secret fetch failed; previous runtime unchanged")
                 value = result.stdout.decode("utf-8")  # No stripping or newline translation.
@@ -135,7 +158,11 @@ def do_install(root, refs, binary_name, port, keep_env=None):
         service = root / "config/opencode/service.json"
         if service.exists():
             saved = json.loads(service.read_text())
-            if not isinstance(saved, dict) or not isinstance(saved.get("password"), str) or not saved["password"]:
+            if (
+                not isinstance(saved, dict)
+                or not isinstance(saved.get("password"), str)
+                or not saved["password"]
+            ):
                 raise ValueError("existing service password invalid; refusing replacement")
         else:
             atomic(service, json.dumps({"password": secrets.token_urlsafe(32)}) + "\n")
@@ -148,13 +175,23 @@ def do_install(root, refs, binary_name, port, keep_env=None):
                 target = root / "config/opencode" / source.name
                 if not target.exists() and not target.is_symlink():
                     target.symlink_to(source.absolute(), target_is_directory=source.is_dir())
-        config = {"binary": binary, "path": os.environ.get("PATH", os.defpath),
-                  "home": str(home), "port": port, "env": fetched}
+        config = {
+            "binary": binary,
+            "path": os.environ.get("PATH", os.defpath),
+            "home": str(home),
+            "port": port,
+            "env": fetched,
+        }
         atomic(root / "runtime.json", json.dumps(config) + "\n")
         atomic(root / "serve.py", Path(__file__).read_text())
         template = Path(__file__).with_name("opencode-serve.service.in").read_text()
-        unit = template.replace("@EXEC@", " ".join(quote(x) for x in
-                                [executable(sys.executable), root / "serve.py", "run", "--root", root]))
+        unit = template.replace(
+            "@EXEC@",
+            " ".join(
+                quote(x)
+                for x in [executable(sys.executable), root / "serve.py", "run", "--root", root]
+            ),
+        )
         unit_dir.mkdir(parents=True, exist_ok=True)
         atomic(unit_dir / "opencode-serve.service", unit)
 
@@ -171,8 +208,9 @@ def install(args):
                 keep = saved_env
         except (OSError, ValueError):
             pass
-    do_install(root, refs, args.opencode or default_opencode(), args.port or DEFAULT_PORT,
-               keep_env=keep)
+    do_install(
+        root, refs, args.opencode or default_opencode(), args.port or DEFAULT_PORT, keep_env=keep
+    )
 
 
 def ask(text, default=None):
@@ -180,7 +218,7 @@ def ask(text, default=None):
     try:
         answer = input(f"{text}{hint}: ").strip()
     except EOFError:
-        raise _Cancel()
+        raise _Cancel() from None
     return answer if answer else ("" if default is None else str(default))
 
 
@@ -189,7 +227,7 @@ def ask_yes(text, default_yes):
     try:
         answer = input(f"{text} [{hint}]: ").strip().lower()
     except EOFError:
-        raise _Cancel()
+        raise _Cancel() from None
     if not answer:
         return default_yes
     if answer in ("y", "yes"):
@@ -202,7 +240,7 @@ def ask_yes(text, default_yes):
 
 def cmd(argv):
     try:
-        return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        return subprocess.run(argv, capture_output=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -288,14 +326,18 @@ def serve_matches(cfg, dns, port):
 def guided_install():
     dirty = False
     if not sys.stdin.isatty():
-        print("opencode-serve: guided install needs a terminal; rerun in a terminal"
-              " or pass explicit flags: install --root DIR --secrets FILE --opencode PATH --port PORT",
-              file=sys.stderr)
+        print(
+            "opencode-serve: guided install needs a terminal; rerun in a terminal"
+            " or pass explicit flags: install --root DIR --secrets FILE --opencode PATH --port PORT",
+            file=sys.stderr,
+        )
         return 1
     try:
         print("Guided setup. Writes only the install root and the user unit.")
-        print("DB is isolated at <root>/data/server.db; provider keys come only"
-              " from the refs file. Host logins are not shared.")
+        print(
+            "DB is isolated at <root>/data/server.db; provider keys come only"
+            " from the refs file. Host logins are not shared."
+        )
         root_raw = ask("Install root", default_root())
         root = Path(root_raw).expanduser()
         root = root if root.is_absolute() else Path.cwd() / root
@@ -305,10 +347,8 @@ def guided_install():
         runtime = root / "runtime.json"
         port_default = DEFAULT_PORT
         if runtime.exists():
-            try:
+            with contextlib.suppress(OSError, ValueError):
                 port_default = port_value(json.loads(runtime.read_text()).get("port", DEFAULT_PORT))
-            except (OSError, ValueError):
-                pass
         while True:
             try:
                 port = port_value(ask("Port", port_default))
@@ -338,7 +378,9 @@ def guided_install():
                 saved_env = json.loads(runtime.read_text()).get("env")
                 if isinstance(saved_env, dict) and saved_env:
                     keep = saved_env
-                    print(f"Keeping {len(keep)} existing runtime secret(s); empty refs will not erase them.")
+                    print(
+                        f"Keeping {len(keep)} existing runtime secret(s); empty refs will not erase them."
+                    )
             except (OSError, ValueError):
                 pass
         names = ", ".join(sorted(refs)) if refs else ("(kept)" if keep else "(none)")
@@ -352,42 +394,62 @@ def guided_install():
                 return 1
             do_install(root, refs, binary, port, keep_env=keep)
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            print("opencode-serve: failed; check inputs, private-file permissions and CLI availability",
-                  file=sys.stderr)
+            print(
+                "opencode-serve: failed; check inputs, private-file permissions and CLI availability",
+                file=sys.stderr,
+            )
             return 1
         dirty = True  # files + unit written
         print("Installed opencode-serve.service; not started yet.")
-        running = started = verified = False
-        if ask_yes("Start/restart service now? (daemon-reload, then enable --now; restarts the unit on reinstall)", True):
+        running = verified = False
+        if ask_yes(
+            "Start/restart service now? (daemon-reload, then enable --now; restarts the unit on reinstall)",
+            True,
+        ):
             reloaded = cmd(["systemctl", "--user", "daemon-reload"])
             if reloaded is None or reloaded.returncode:
-                print("systemctl daemon-reload failed; run: systemctl --user daemon-reload", file=sys.stderr)
+                print(
+                    "systemctl daemon-reload failed; run: systemctl --user daemon-reload",
+                    file=sys.stderr,
+                )
             else:
                 active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
                 was_active = active is not None and active.returncode == 0
                 if not was_active and port_listening(port):
                     # Never proxy or restart over an unrelated listener.
-                    print(f"Port {port} already answers and the unit is inactive; unrelated"
-                          f" listener suspected. Start skipped; free the port or pick another"
-                          f" port and reinstall.", file=sys.stderr)
+                    print(
+                        f"Port {port} already answers and the unit is inactive; unrelated"
+                        f" listener suspected. Start skipped; free the port or pick another"
+                        f" port and reinstall.",
+                        file=sys.stderr,
+                    )
                 else:
                     verb = ["restart"] if was_active else ["enable", "--now"]
                     done = cmd(["systemctl", "--user", *verb, "opencode-serve.service"])
                     if done is None or done.returncode:
-                        print("Service start failed; not exposing via Tailscale."
-                              " Run: systemctl --user status opencode-serve.service", file=sys.stderr)
+                        print(
+                            "Service start failed; not exposing via Tailscale."
+                            " Run: systemctl --user status opencode-serve.service",
+                            file=sys.stderr,
+                        )
                     else:
-                        started = True
                         active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
                         password = service_password(root)
-                        if (active is not None and active.returncode == 0 and password
-                                and verify_service(port, password)):
+                        if (
+                            active is not None
+                            and active.returncode == 0
+                            and password
+                            and verify_service(port, password)
+                        ):
                             running = verified = True
                         else:
-                            print("Service start reported success but the unit is not active or"
-                                  f" {API_INFO} did not reject bad auth and accept the real password"
-                                  f" on 127.0.0.1:{port}; skipping Tailscale."
-                                  " Run: systemctl --user status opencode-serve.service", file=sys.stderr)
+                            print(
+                                "Service start reported success but the unit is not active or"
+                                f" {API_INFO} did not reject bad auth and accept the real password"
+                                f" on 127.0.0.1:{port}; skipping Tailscale."
+                                " Run: systemctl --user status opencode-serve.service",
+                                file=sys.stderr,
+                            )
         else:
             active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
             running = active is not None and active.returncode == 0
@@ -395,15 +457,23 @@ def guided_install():
                 password = service_password(root)
                 verified = bool(password and verify_service(port, password))
             print("Skipped service start.")
-        if ask_yes("Enable linger so the unit survives logout? (loginctl enable-linger, may need permission)", False):
+        if ask_yes(
+            "Enable linger so the unit survives logout? (loginctl enable-linger, may need permission)",
+            False,
+        ):
             user = os.environ.get("USER") or Path.home().name
             lingered = cmd(["loginctl", "enable-linger", user])
             if lingered is None or lingered.returncode:
-                print(f"loginctl failed (no sudo attempted); run yourself: loginctl enable-linger {user}",
-                      file=sys.stderr)
+                print(
+                    f"loginctl failed (no sudo attempted); run yourself: loginctl enable-linger {user}",
+                    file=sys.stderr,
+                )
         if verified:
-            if ask_yes("Expose on tailnet via Tailscale Serve? (tailnet-only HTTPS;"
-                       " anyone with tailnet access plus password gets full coding access)", False):
+            if ask_yes(
+                "Expose on tailnet via Tailscale Serve? (tailnet-only HTTPS;"
+                " anyone with tailnet access plus password gets full coding access)",
+                False,
+            ):
                 if not shutil.which("tailscale"):
                     print("tailscale not found; install it first.", file=sys.stderr)
                 else:
@@ -411,50 +481,78 @@ def guided_install():
                     dns = None
                     if status is not None and status.returncode == 0:
                         try:
-                            dns = json.loads(status.stdout.decode()).get("Self", {}).get("DNSName", "").rstrip(".")
+                            dns = (
+                                json.loads(status.stdout.decode())
+                                .get("Self", {})
+                                .get("DNSName", "")
+                                .rstrip(".")
+                            )
                         except (ValueError, AttributeError):
                             dns = None
                     if not dns:
-                        print("Cannot read tailnet DNS name; run: tailscale status --json", file=sys.stderr)
+                        print(
+                            "Cannot read tailnet DNS name; run: tailscale status --json",
+                            file=sys.stderr,
+                        )
                     else:
                         current = cmd(["tailscale", "serve", "status", "--json"])
                         if current is None or current.returncode:
-                            print("Cannot read Serve state; run: tailscale serve status", file=sys.stderr)
+                            print(
+                                "Cannot read Serve state; run: tailscale serve status",
+                                file=sys.stderr,
+                            )
                             if denied(current):
-                                print("Access denied suggests Serve is root-managed; check with:"
-                                      " sudo tailscale serve status", file=sys.stderr)
+                                print(
+                                    "Access denied suggests Serve is root-managed; check with:"
+                                    " sudo tailscale serve status",
+                                    file=sys.stderr,
+                                )
                         else:
                             try:
-                                cfg = json.loads((current.stdout or b"null").decode().strip() or "null")
+                                cfg = json.loads(
+                                    (current.stdout or b"null").decode().strip() or "null"
+                                )
                             except ValueError:
                                 cfg = "invalid"
                             if cfg in (None, {}):
-                                exposed = cmd(["tailscale", "serve", "--bg", f"http://127.0.0.1:{port}"])
+                                exposed = cmd(
+                                    ["tailscale", "serve", "--bg", f"http://127.0.0.1:{port}"]
+                                )
                                 if exposed is None or exposed.returncode:
                                     if denied(exposed):
-                                        print("Tailscale permission denied; no sudo attempted. Run yourself:\n"
-                                              f"  sudo tailscale serve --bg http://127.0.0.1:{port}\n"
-                                              "Optional: sudo tailscale set --operator=$USER grants this user"
-                                              " broader Tailscale control; choose only if intended.", file=sys.stderr)
+                                        print(
+                                            "Tailscale permission denied; no sudo attempted. Run yourself:\n"
+                                            f"  sudo tailscale serve --bg http://127.0.0.1:{port}\n"
+                                            "Optional: sudo tailscale set --operator=$USER grants this user"
+                                            " broader Tailscale control; choose only if intended.",
+                                            file=sys.stderr,
+                                        )
                                     else:
-                                        print("tailscale serve failed; check HTTPS certificates and permissions;"
-                                              " run: tailscale serve status", file=sys.stderr)
+                                        print(
+                                            "tailscale serve failed; check HTTPS certificates and permissions;"
+                                            " run: tailscale serve status",
+                                            file=sys.stderr,
+                                        )
                                 else:
                                     print(f"Serving at https://{dns}")
                             elif cfg != "invalid" and serve_matches(cfg, dns, port):
                                 print(f"Already serving at https://{dns}; nothing changed.")
                             else:
-                                print("Existing Serve config found; refusing to overwrite it."
-                                      " Inspect with: tailscale serve status (never reset without backup)",
-                                      file=sys.stderr)
-                                    # ponytail: no raw-config merge; add only for an explicit --force path.
+                                print(
+                                    "Existing Serve config found; refusing to overwrite it."
+                                    " Inspect with: tailscale serve status (never reset without backup)",
+                                    file=sys.stderr,
+                                )
+                                # ponytail: no raw-config merge; add only for an explicit --force path.
         else:
             if running:
                 print("Service running but endpoint not verified; skipping Tailscale exposure.")
             else:
                 print("Service not running; skipping Tailscale exposure.")
         print("Password stays private. As user `opencode`, get it with:")
-        print(f"  python3 -c \"import json;print(json.load(open('{root}/config/opencode/service.json'))['password'])\"")
+        print(
+            f"  python3 -c \"import json;print(json.load(open('{root}/config/opencode/service.json'))['password'])\""
+        )
         print("Serve state: tailscale serve status")
         return 0
     except _Cancel:
@@ -470,10 +568,16 @@ def run(root):
     password = service_password(root)
     if not password:
         raise ValueError("server password missing; refusing unauthenticated startup")
-    env = {"HOME": config["home"], "PATH": config["path"], "LANG": "C.UTF-8",
-           "XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data"),
-           "XDG_STATE_HOME": str(root / "state"), "XDG_CACHE_HOME": str(root / "cache"),
-           "OPENCODE_DB": str(root / "data/server.db")}
+    env = {
+        "HOME": config["home"],
+        "PATH": config["path"],
+        "LANG": "C.UTF-8",
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "OPENCODE_DB": str(root / "data/server.db"),
+    }
     env.update(config["env"])
     env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
     # Both streams suppressed: OpenCode can print passwords; no journal leaks.
@@ -484,8 +588,19 @@ def run(root):
             os.dup2(sink.fileno(), 2)
             os.umask(0o077)
             os.chdir(config["home"])
-            os.execve(config["binary"], [config["binary"], "serve", "--service", "--hostname",
-                                         "127.0.0.1", "--port", str(port)], env)
+            os.execve(
+                config["binary"],
+                [
+                    config["binary"],
+                    "serve",
+                    "--service",
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                ],
+                env,
+            )
         finally:
             os.dup2(saved_err, 2)
             os.close(saved_err)
@@ -497,17 +612,25 @@ def main():
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--secrets", type=Path, default=None)
     parser.add_argument("--opencode", default=None)
-    parser.add_argument("--port", type=port_value, default=None,
-                        help="install-time listen port, 1..65535 (run uses runtime.json)")
+    parser.add_argument(
+        "--port",
+        type=port_value,
+        default=None,
+        help="install-time listen port, 1..65535 (run uses runtime.json)",
+    )
     args = parser.parse_args()
-    if args.action == "install" and any(getattr(args, name) is not None
-                                        for name in ("root", "secrets", "opencode", "port")):
+    if args.action == "install" and any(
+        getattr(args, name) is not None for name in ("root", "secrets", "opencode", "port")
+    ):
         try:
             os.umask(0o077)
             install(args)
         except (OSError, ValueError, subprocess.TimeoutExpired):
             # Do not print exception strings: JSON / subprocess errors may contain secrets.
-            print("opencode-serve: failed; check inputs, private-file permissions and CLI availability", file=sys.stderr)
+            print(
+                "opencode-serve: failed; check inputs, private-file permissions and CLI availability",
+                file=sys.stderr,
+            )
             return 1
         print("Installed opencode-serve.service; not started. See README for manual activation.")
         return 0
@@ -519,7 +642,10 @@ def main():
             run((args.root or default_root()).absolute())
     except (OSError, ValueError, subprocess.TimeoutExpired):
         # Do not print exception strings: JSON / subprocess errors may contain secrets.
-        print("opencode-serve: failed; check inputs, private-file permissions and CLI availability", file=sys.stderr)
+        print(
+            "opencode-serve: failed; check inputs, private-file permissions and CLI availability",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

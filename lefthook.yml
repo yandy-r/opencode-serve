@@ -1,0 +1,13 @@
+pre-commit:
+  parallel: true
+  commands:
+    style-lint:
+      run: ./scripts/style.sh lint --staged --fix
+      stage_fixed: true
+    style-format:
+      run: ./scripts/style.sh format --staged
+      stage_fixed: true
+pre-push:
+  commands:
+    test:
+      run: python3 test_serve.py

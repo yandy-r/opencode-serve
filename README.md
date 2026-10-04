@@ -38,13 +38,13 @@ execution.
    - A summary before anything is written; Ctrl-C, EOF, or `n` cancels with
      zero changes. Cancel/EOF are safe at every prompt.
 3. If you accept, it writes files, then offers: `systemctl --user
-   daemon-reload` + `enable --now` (or an explicit restart on reinstall),
+daemon-reload` + `enable --now` (or an explicit restart on reinstall),
    optional `loginctl enable-linger` (run yourself if it needs permission; the
    installer never uses sudo), and optional Tailscale Serve exposure
    (tailnet-only HTTPS via `tailscale serve --bg http://127.0.0.1:PORT`). If
    Serve is root-managed, a failed `serve` prints only the matching `sudo`
    recovery command (never run by the installer); `sudo tailscale set
-   --operator=$USER` is shown as optional broader access.
+--operator=$USER` is shown as optional broader access.
 4. The database is isolated: the server uses `<root>/data/server.db` and only
    the refs-file keys; host logins and ambient API keys are not shared.
 5. Password stays private; the installer never prints it. Retrieve it with
@@ -71,7 +71,7 @@ before:
 
 1. Refs file `{"ENV_NAME": "op://vault/item/field", ...}`. Reserved names:
    `HOME PATH OP_SERVICE_ACCOUNT_TOKEN OPENCODE_DB OPENCODE_PASSWORD
-   OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
+OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
    `OPENCODE_SERVE_`, or `_`. Relative `--secrets` paths resolve against the
    current directory, independent of `--root`.
 2. Writes only `<root>/` (`config/ data/ state/ cache/ runtime.json serve.py`,
@@ -130,3 +130,59 @@ Keep ACLs tight, rotate often.
   network path, browser sign-in. Binary auth probed only on ephemeral ports
   with isolated HOME.
 - `opencode pair` is unused here and its behavior with this setup is unverified.
+
+## Linting & Formatting
+
+This project uses a self-contained lint/format bundle rooted in `scripts/style.sh`.
+Run it directly, via the package-manager aliases below, or wire it into CI.
+
+### One-command bootstrap
+
+If you cloned this repo fresh and `scripts/style.sh` is missing (it ships
+managed), re-run `formatters --sync` from opencode to reinstall the bundle.
+
+### Daily commands
+
+```bash
+./scripts/style.sh lint                  # full lint pass (all detected languages)
+./scripts/style.sh lint --fix            # auto-fix what is auto-fixable
+./scripts/style.sh lint --modified       # staged + unstaged + untracked
+./scripts/style.sh lint --staged         # only files staged in the git index
+./scripts/style.sh lint --unstaged       # only unstaged + untracked changes
+./scripts/style.sh lint --fix --modified # fast pre-push loop
+./scripts/style.sh format                # format everything
+./scripts/style.sh format --modified     # format modified files
+./scripts/style.sh format --staged       # format only staged files
+./scripts/style.sh format --unstaged     # format only unstaged + untracked
+```
+
+### Per-language tools
+
+- **Python**: `ruff` (lint + import sort) + `black` (format). Config: `[tool.ruff]` and `[tool.black]` in `pyproject.toml`.
+
+- **Docs**: `markdownlint` + `prettier` (`.markdownlint.json`, `.prettierrc`)
+  for Markdown/YAML. In docs-only repos, Prettier also owns JSON/JSONC.
+
+- **Shell**: `shellcheck --severity=warning` on `*.sh`.
+
+### CI
+
+To wire lint into CI, run `formatters --ci` (installs both `lint.yml` and
+`lint-autofix.yml`) or pair it with `--no-autofix` to skip the autofix workflow.
+
+### Pre-commit hook (optional)
+
+A pre-commit hook is installed. It runs `./scripts/style.sh lint --staged --fix` and
+`./scripts/style.sh format --staged` before every commit. To bypass once:
+`git commit --no-verify`.
+
+### Advanced
+
+- **Upgrade the bundle**: re-run `formatters --sync` from opencode. This prunes
+  stale managed files and copies the latest scripts.
+- **Ignore paths**: add entries to `.prettierignore`, `.markdownlintignore`,
+  `.gitignore`, or tool-native ignore keys (`ruff exclude`, `biome files.ignore`,
+  `.golangci.yml issues.exclude-rules`).
+- **Modified-only mode** reads `git diff --name-only HEAD` — untracked files are
+  included when `scripts/lib/modified-files.sh` sees them with
+  `git status --porcelain`.
