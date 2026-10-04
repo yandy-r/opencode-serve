@@ -774,6 +774,7 @@ def remove_checks(mod, base, home, bindir):
         XDG_DATA_HOME=str(comp_root.parent),
         SHELL="/bin/bash",
     )
+    comp_env.pop("BASH_COMPLETION_USER_DIR", None)
     comp_ok = True
     for shell in ("bash", "zsh"):
         done = subprocess.run(
@@ -784,26 +785,26 @@ def remove_checks(mod, base, home, bindir):
             timeout=30,
         )
         comp_ok = comp_ok and done.returncode == 0
-    pre = {
-        shell: (comp_root / f"completions/serve.py.{shell}").read_bytes()
-        for shell in ("bash", "zsh")
+    targets = {
+        "bash": comp_root.parent / "bash-completion/completions/serve.py.bash",
+        "zsh": comp_root.parent / "zsh/site-functions/_serve.py",
     }
+    pre = {shell: target.read_bytes() for shell, target in targets.items()}
     check(
         "pre-install generated completions",
         comp_ok and all(pre[shell] == mod.COMPLETIONS[shell].encode() for shell in pre),
     )
     first = do_install(mod, base, home, bindir, {}, comp_root)
     check(
-        "install accepts completions-only root, contents untouched",
+        "install after completions leaves external files untouched",
         first.returncode == 0
         and (comp_root / "runtime.json").exists()
-        and all((comp_root / f"completions/serve.py.{s}").read_bytes() == pre[s] for s in pre),
+        and all(targets[s].read_bytes() == pre[s] for s in pre),
     )
     again = do_install(mod, base, home, bindir, {}, comp_root)
     check(
-        "reinstall over completions root recognized",
-        again.returncode == 0
-        and all((comp_root / f"completions/serve.py.{s}").read_bytes() == pre[s] for s in pre),
+        "reinstall leaves external completions untouched",
+        again.returncode == 0 and all(targets[s].read_bytes() == pre[s] for s in pre),
     )
     link_root = base / "comp-symlink-root"
     (base / "comp-target").mkdir()
@@ -1122,9 +1123,12 @@ def completion_checks(mod, base):
     )
 
     def cli(*args, overrides=None):
+        filtered = dict(env)
+        filtered.pop("BASH_COMPLETION_USER_DIR", None)
+        filtered = {**filtered, **(overrides or {})}
         return subprocess.run(
             [sys.executable, str(REPO / "serve.py"), "completion", *args],
-            env=dict(env, **(overrides or {})),
+            env=filtered,
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
@@ -1137,11 +1141,11 @@ def completion_checks(mod, base):
             f"{shell} completion generation",
             printed.returncode == 0 and printed.stdout == mod.COMPLETIONS[shell],
         )
-        target = (
-            config / "fish/conf.d/opencode-serve.fish"
-            if shell == "fish"
-            else data / f"opencode-serve/completions/serve.py.{shell}"
-        )
+        target = {
+            "bash": data / "bash-completion/completions/serve.py.bash",
+            "zsh": data / "zsh/site-functions/_serve.py",
+            "fish": config / "fish/completions/serve.py.fish",
+        }[shell]
         rc = None if shell == "fish" else home / ("zdot/.zshrc" if shell == "zsh" else ".bashrc")
         if rc is not None:
             rc.parent.mkdir(parents=True, exist_ok=True)
@@ -1155,9 +1159,17 @@ def completion_checks(mod, base):
         if rc is not None:
             check(
                 f"{shell} config preserved",
-                rc.read_text().startswith("# existing config\nexport CUSTOM_SETTING=kept\n")
+                rc.read_text() == "# existing config\nexport CUSTOM_SETTING=kept\n"
                 and stat.S_IMODE(rc.stat().st_mode) == 0o640,
             )
+        check(
+            f"{shell} installed path and profile note",
+            str(target) in installed.stdout
+            and (("fpath=" in installed.stdout) == (shell == "zsh")),
+        )
+        if shell == "zsh":
+            check("zsh compdef header", target.read_text().startswith("#compdef serve.py\n"))
+        target.chmod(0o640)
         target.write_text("existing custom completion\n")
         before_rc = rc.read_text() if rc else None
         refused = cli(shell, "--install")
@@ -1172,7 +1184,8 @@ def completion_checks(mod, base):
             f"{shell} forced completion replacement",
             forced.returncode == 0
             and target.read_text() == printed.stdout
-            and (rc is None or rc.read_text().count("# >>> opencode-serve completion >>>") == 1),
+            and stat.S_IMODE(target.stat().st_mode) == 0o640
+            and (rc is None or rc.read_text() == before_rc),
         )
         executable = shutil.which(shell)
         if executable:
@@ -1181,11 +1194,12 @@ def completion_checks(mod, base):
             )
             check(f"{shell} completion syntax", parsed.returncode == 0)
             if shell == "bash":
-                activation = f"source {shlex.quote(str(rc))}; complete -p serve.py"
+                activation = f"source {shlex.quote(str(target))}; complete -p serve.py"
                 command = [executable, "--norc", "-c", activation]
             elif shell == "zsh":
                 activation = (
-                    f"source {shlex.quote(str(rc))}; [[ ${{_comps[serve.py]}} == _opencode_serve ]]"
+                    f"fpath=({shlex.quote(str(target.parent))} $fpath); "
+                    "autoload -Uz compinit; compinit -u; [[ ${_comps[serve.py]} == _serve.py ]]"
                 )
                 command = [executable, "-f", "-c", activation]
             else:
@@ -1217,13 +1231,15 @@ def completion_checks(mod, base):
     )
     zrc = home / "zdot/.zshrc"
     zrc.write_text("# >>> opencode-serve completion >>>\nunterminated block\n")
-    ztarget = data / "opencode-serve/completions/serve.py.zsh"
+    ztarget = data / "zsh/site-functions/_serve.py"
     before = ztarget.read_text()
     check(
-        "completion invalid rc block leaves files unchanged",
-        cli("zsh", "--install", "--force").returncode == 1 and ztarget.read_text() == before,
+        "completion ignores legacy rc block",
+        cli("zsh", "--install", "--force").returncode == 0
+        and ztarget.read_text() == before
+        and zrc.read_text() == "# >>> opencode-serve completion >>>\nunterminated block\n",
     )
-    btarget = data / "opencode-serve/completions/serve.py.bash"
+    btarget = data / "bash-completion/completions/serve.py.bash"
     original = home / "unrelated-completion"
     original.write_text("do not overwrite\n")
     btarget.unlink()
@@ -1263,20 +1279,57 @@ def completion_checks(mod, base):
     check(
         "completion reinstall after special file checks", cli("bash", "--install").returncode == 0
     )
+    override = home / "bash override"
     saved_env = dict(os.environ)
-    old_atomic = mod.atomic
     old_replace = mod.os.replace
-    bashrc = home / ".bashrc"
-    before_rc = bashrc.read_text()
+    try:
+        os.environ.update(env)
+        os.environ["BASH_COMPLETION_USER_DIR"] = str(override)
+        mod.install_completion("bash", True)
+        check(
+            "bash completion user directory override",
+            (override / "completions/serve.py.bash").read_text() == mod.COMPLETIONS["bash"],
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+    colon = home / "colon dir" / "first"
+    installed = cli(
+        "bash",
+        "--install",
+        overrides={"BASH_COMPLETION_USER_DIR": f":{colon}:/ignored"},
+    )
+    check(
+        "bash completion user dir skips empty colon entries",
+        installed.returncode == 0
+        and (colon / "completions/serve.py.bash").read_text() == mod.COMPLETIONS["bash"],
+    )
+    installed = cli("zsh", "--install", overrides={"XDG_DATA_HOME": ""})
+    check(
+        "completion empty XDG_DATA_HOME falls back to home default",
+        installed.returncode == 0
+        and (home / ".local/share/zsh/site-functions/_serve.py").read_text()
+        == mod.COMPLETIONS["zsh"],
+    )
+    installed = cli("fish", "--install", overrides={"XDG_CONFIG_HOME": ""})
+    check(
+        "completion empty XDG_CONFIG_HOME falls back to home default",
+        installed.returncode == 0
+        and (home / ".config/fish/completions/serve.py.fish").read_text()
+        == mod.COMPLETIONS["fish"],
+    )
+    saved_env = dict(os.environ)
+    old_replace = mod.os.replace
 
-    def failed_rc_write(path, text, mode=0o600):
-        if path == bashrc:
-            raise OSError("simulated config write failure")
-        old_atomic(path, text, mode)
+    def failed_replace(source, target):
+        if target == btarget:
+            raise OSError("simulated completion write failure")
+        old_replace(source, target)
 
     try:
         os.environ.update(env)
-        mod.atomic = failed_rc_write
+        os.environ.pop("BASH_COMPLETION_USER_DIR", None)
+        mod.os.replace = failed_replace
         for existing in (True, False):
             if existing:
                 btarget.write_text("keep prior completion\n")
@@ -1289,48 +1342,21 @@ def completion_checks(mod, base):
             except OSError:
                 failed = True
             check(
-                "completion config failure rolls back completion file",
+                "completion atomic failure preserves existing or removes new file",
                 failed
-                and bashrc.read_text() == before_rc
                 and (
                     btarget.read_text() == "keep prior completion\n"
                     and stat.S_IMODE(btarget.stat().st_mode) == 0o640
                     if existing
                     else not btarget.exists()
                 )
-                and not list(btarget.parent.glob(".completion-backup-*")),
+                and not list(btarget.parent.glob(".tmp-*")),
             )
-        btarget.write_text("recoverable prior completion\n")
-
-        def failed_restore(source, target):
-            if Path(source).name.startswith(".completion-backup-"):
-                raise OSError("simulated rollback failure")
-            old_replace(source, target)
-
-        mod.os.replace = failed_restore
-        try:
-            mod.install_completion("bash", True)
-            failed = False
-        except OSError as error:
-            failed = "previous completion retained at" in str(error)
-        backups = list(btarget.parent.glob(".completion-backup-*"))
-        check(
-            "completion retains backup on rollback failure",
-            failed
-            and len(backups) == 1
-            and backups[0].read_text() == "recoverable prior completion\n",
-        )
-        mod.os.replace = old_replace
-        if backups:
-            old_replace(backups[0], btarget)
     finally:
-        mod.atomic = old_atomic
         mod.os.replace = old_replace
         os.environ.clear()
         os.environ.update(saved_env)
-    check(
-        "completion reinstall after rollback", cli("bash", "--install", "--force").returncode == 0
-    )
+    check("completion reinstall after write failure", cli("bash", "--install").returncode == 0)
 
     bash = shutil.which("bash")
     if bash:

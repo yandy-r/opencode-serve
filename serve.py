@@ -79,7 +79,8 @@ _opencode_serve() {
 }
 complete -F _opencode_serve serve.py
 """,
-    "zsh": r"""# opencode-serve Zsh completion (source this file).
+    "zsh": r"""#compdef serve.py
+# opencode-serve Zsh completion.
 _opencode_serve() {
     local context state state_descr line
     typeset -A opt_args
@@ -115,11 +116,7 @@ _opencode_serve() {
             esac ;;
     esac
 }
-if (( ! $+functions[compdef] )); then
-    autoload -Uz compinit
-    compinit
-fi
-compdef _opencode_serve serve.py
+_opencode_serve "$@"
 """,
     "fish": r"""# opencode-serve Fish completion.
 complete -c serve.py -f
@@ -141,81 +138,56 @@ complete -c serve.py -n '__fish_seen_subcommand_from completion' -l force -d 'Re
 }
 
 
-def install_completion(shell, force):
+def completion_destination(shell):
+    """Standards-based per-shell location; no shell profile is ever edited."""
     home = Path.home()
     if shell == "fish":
-        config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
-        # Eager loading also supports ./serve.py when its directory is not on PATH.
-        destination = config / "fish/conf.d/opencode-serve.fish"
-        rc = None
-    else:
-        data = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share"))
-        destination = data / "opencode-serve/completions" / f"serve.py.{shell}"
-        rc = (
-            Path(os.environ.get("ZDOTDIR", home)) / ".zshrc" if shell == "zsh" else home / ".bashrc"
-        ).resolve()
-    destination = destination.absolute()
+        config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+        return config / "fish/completions/serve.py.fish"
+    if shell == "zsh":
+        data = Path(os.environ.get("XDG_DATA_HOME") or home / ".local/share")
+        return data / "zsh/site-functions/_serve.py"
+    # bash-completion treats BASH_COMPLETION_USER_DIR as a colon-separated
+    # search path; new completions go to the first nonempty entry.
+    override = next(
+        (entry for entry in os.environ.get("BASH_COMPLETION_USER_DIR", "").split(":") if entry),
+        None,
+    )
+    base = (
+        Path(override)
+        if override
+        else Path(os.environ.get("XDG_DATA_HOME") or home / ".local/share") / "bash-completion"
+    )
+    return base / "completions/serve.py.bash"
+
+
+def install_completion(shell, force):
+    destination = completion_destination(shell).absolute()
     if destination.exists() and not destination.is_symlink() and not destination.is_file():
         raise ValueError(
             "completion path is not a regular file; choose a different data/config directory"
         )
     if (destination.exists() or destination.is_symlink()) and not force:
         raise ValueError("completion file exists; use --force to replace it")
-    rc_text = None
-    if rc is not None:
-        previous = rc.read_text() if rc.exists() else ""
-        start, end = "# >>> opencode-serve completion >>>", "# <<< opencode-serve completion <<<"
-        block = f"{start}\nif [ -r {shlex.quote(str(destination))} ]; then\n    . {shlex.quote(str(destination))}\nfi\n{end}"
-        if start in previous or end in previous:
-            if previous.count(start) != 1 or previous.count(end) != 1:
-                raise ValueError(
-                    "invalid completion block in shell config; fix it before installing"
-                )
-            before, rest = previous.split(start)
-            if end not in rest:
-                raise ValueError(
-                    "invalid completion block in shell config; fix it before installing"
-                )
-            _, after = rest.split(end)
-            rc_text = before + block + after
-        else:
-            rc_text = (
-                previous + ("\n" if previous and not previous.endswith("\n") else "") + block + "\n"
-            )
     destination.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
-    if destination.exists() or destination.is_symlink():
-        fd, name = tempfile.mkstemp(prefix=".completion-backup-", dir=destination.parent)
-        os.close(fd)
-        backup = Path(name)
-        try:
-            backup.unlink()
-            shutil.copy2(destination, backup, follow_symlinks=False)
-        except OSError:
-            backup.unlink(missing_ok=True)
-            raise
+    existing = destination.exists() or destination.is_symlink()
+    mode = (
+        stat.S_IMODE(destination.stat().st_mode)
+        if destination.is_file() and not destination.is_symlink()
+        else 0o644
+    )
     try:
-        atomic(destination, COMPLETIONS[shell], mode=0o644)
-        if rc is not None:
-            rc.parent.mkdir(parents=True, exist_ok=True)
-            mode = rc.stat().st_mode & 0o777 if rc.exists() else 0o600
-            atomic(rc, rc_text, mode=mode)
+        atomic(destination, COMPLETIONS[shell], mode=mode)
     except (OSError, ValueError):
-        try:
-            if backup is not None:
-                os.replace(backup, destination)
-            else:
-                destination.unlink(missing_ok=True)
-        except OSError as error:
-            recovery = f"previous completion retained at {backup}" if backup else str(destination)
-            raise OSError(f"completion rollback failed; inspect {recovery}") from error
+        if not existing:
+            destination.unlink(missing_ok=True)
         raise
-    if backup is not None:
-        try:
-            backup.unlink(missing_ok=True)
-        except OSError:
-            print(f"Completion installed; old backup retained at {backup}", file=sys.stderr)
     print(f"Installed {shell} completions: {destination}")
+    if shell == "zsh":
+        print(
+            "If this directory is not on $fpath, add before compinit: "
+            f"fpath=({shlex.quote(str(destination.parent))} $fpath)"
+        )
     print("Open a new shell to load the completions.")
 
 
@@ -432,8 +404,9 @@ def do_install(
     op = executable("op") if refs else None
     with operation_lock():
         if root.exists() and not recognized_install(root, runtime_config(root)):
-            # `completion --install` writes <root>/completions for the default root; its
-            # contents stay untouched. Everything else unexpected keeps the refusal.
+            # Legacy installs placed `completion --install` output in <root>/completions
+            # (it now writes to shell-standard XDG directories); that directory stays
+            # untouched. Everything else unexpected keeps the refusal.
             unexpected = [
                 p.name
                 for p in root.iterdir()

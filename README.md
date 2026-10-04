@@ -24,15 +24,18 @@ Completions work with direct invocation (`./serve.py`, `/path/to/serve.py`, or
 or directory arguments. Password and port values have no suggestions. Invoking
 the script through `python3 serve.py` uses Python's shell completion instead.
 
-Bash and Zsh scripts are installed under
-`${XDG_DATA_HOME:-~/.local/share}/opencode-serve/completions/`, with a managed
-source block added to `~/.bashrc` or `${ZDOTDIR:-~}/.zshrc`. Existing shell config
-text and file mode are preserved, and reinstalling updates that block without
-duplicating it. Config files are replaced atomically; hardlinks and extended
-metadata are not retained.
-Fish loads `${XDG_CONFIG_HOME:-~/.config}/fish/conf.d/opencode-serve.fish` at
-startup, which also enables completion for `./serve.py` outside `PATH`, and
-needs no edits to `config.fish`. Open a new shell after installation. The command installs
+Installations go to the standards-based per-shell user directories and never
+edit `~/.bashrc`, `${ZDOTDIR:-~}/.zshrc`, or `config.fish`:
+
+- Bash: `${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/serve.py.bash`.
+  If `BASH_COMPLETION_USER_DIR` is set, its first nonempty colon-separated entry
+  replaces the `bash-completion` base directory.
+- Zsh: `${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions/_serve.py` with a
+  `#compdef serve.py` header; ensure the site-functions directory is on
+  `$fpath` before `compinit` runs (the installer prints a reminder).
+- Fish: `${XDG_CONFIG_HOME:-~/.config}/fish/completions/serve.py.fish`
+
+Open a new shell after installation. The command installs
 only user completions; it does not install or start the server.
 
 ## Auth notes (opencode v2.0.22)
@@ -134,8 +137,8 @@ OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
    `~/.config/systemd/user/opencode-serve.service`. Unit names are fixed;
    rerun install after moving root. First installation requires an empty,
    dedicated root, except for `.install.lock` and a real (not symlink)
-   `completions/` directory created by shell completion setup. Completion
-   contents stay untouched during installation. Other nonempty, unrecognized
+   `completions/` directory from legacy shell completion installs, which
+   stays untouched. Other nonempty, unrecognized
    roots are refused; guided and flags-based setup report the root and
    unexpected entry names with terminal-safe escaping. Recognized reinstallations
    remain supported. Operations on
