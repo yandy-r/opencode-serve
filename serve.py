@@ -72,9 +72,10 @@ _opencode_serve() {
     case "$action" in
         install) options+=' --root --secrets --opencode --port --password --pasword --use-ts --hostname --cors' ;;
         run) options+=' --root' ;;
+        update) options+=' --root --check' ;;
         remove) options+=' --root --purge' ;;
         completion) options+=' bash zsh fish --install --force' ;;
-        *) options+=' install run completion remove' ;;
+        *) options+=' install run update completion remove' ;;
     esac
     while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -W "$options" -- "$cur")
 }
@@ -87,7 +88,7 @@ _opencode_serve() {
     typeset -A opt_args
     _arguments -C \
         '(-h --help)'{-h,--help}'[Show help]' \
-        '1:action:(install run completion remove)' \
+        '1:action:(install run update completion remove)' \
         '*::argument:->arguments'
     case "$state" in
         arguments)
@@ -106,6 +107,10 @@ _opencode_serve() {
                 run)
                     _arguments '--root[Install root]:directory:_directories' \
                         '(-h --help)'{-h,--help}'[Show help]' ;;
+                update)
+                    _arguments '--root[Install root]:directory:_directories' \
+                        '--check[Restart only when the configured binary changed]' \
+                        '(-h --help)'{-h,--help}'[Show help]' ;;
                 remove)
                     _arguments '--root[Install root]:directory:_directories' \
                         '--purge[Delete installation data and credentials]' \
@@ -122,9 +127,9 @@ _opencode_serve "$@"
 """,
     "fish": r"""# opencode-serve Fish completion.
 complete -c serve.py -f
-complete -c serve.py -n '__fish_use_subcommand' -a 'install run completion remove'
+complete -c serve.py -n '__fish_use_subcommand' -a 'install run update completion remove'
 complete -c serve.py -s h -l help -d 'Show help'
-complete -c serve.py -n '__fish_seen_subcommand_from install run remove' -l root -r -a '(__fish_complete_directories)' -d 'Install root'
+complete -c serve.py -n '__fish_seen_subcommand_from install run update remove' -l root -r -a '(__fish_complete_directories)' -d 'Install root'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l secrets -r -F -d '1Password references JSON'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l opencode -r -F -d 'OpenCode executable'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l port -x -d 'Listen port'
@@ -132,6 +137,7 @@ complete -c serve.py -n '__fish_seen_subcommand_from install' -l use-ts -x -a 't
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l hostname -x -d 'Bind IP for external proxy'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l cors -x -d 'Allowed browser origin (repeatable)'
 complete -c serve.py -n '__fish_seen_subcommand_from remove' -l purge -d 'Delete installation data and credentials'
+complete -c serve.py -n '__fish_seen_subcommand_from update' -l check -d 'Restart only when the configured binary changed'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l password -x -d 'Set server password'
 complete -c serve.py -n '__fish_seen_subcommand_from install' -l pasword -x -d 'Set server password'
 complete -c serve.py -n '__fish_seen_subcommand_from completion; and not __fish_seen_subcommand_from bash zsh fish' -a 'bash zsh fish'
@@ -274,6 +280,54 @@ def quote(value):
         '"'
         + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
         + '"'
+    )
+
+
+def binary_fingerprint(path):
+    """Identity fields of the binary, following symlinks."""
+    metadata = os.stat(path)
+    return [metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_size]
+
+
+def unit_owned_by(unit, action, root, *extra):
+    """The single ExecStart line of `unit` must launch this root's serve.py."""
+    if unit.is_symlink():
+        return False
+    try:
+        exec_lines = [
+            line for line in unit.read_text().splitlines() if line.startswith("ExecStart=")
+        ]
+    except OSError:
+        return False
+    suffix = " " + " ".join(quote(x) for x in (root / "serve.py", action, *extra, "--root", root))
+    return len(exec_lines) == 1 and exec_lines[0].endswith(suffix)
+
+
+UPDATE_TIMER_NAME = "opencode-serve-update.timer"
+# Must match opencode-serve-update.timer.in; the installed launcher copy lacks the template.
+UPDATE_TIMER_TEXT = """[Unit]
+Description=Check for an updated OpenCode binary (opencode-serve)
+
+[Timer]
+OnCalendar=*:0/2
+Persistent=true
+Unit=opencode-serve-update.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def timer_owned_by(timer, root):
+    """Timer is ours: known rendered template, or explicit `# install_root=<root>` marker."""
+    if timer.is_symlink():
+        return False
+    try:
+        text = timer.read_text()
+    except OSError:
+        return False
+    return text.rstrip("\n") == UPDATE_TIMER_TEXT.rstrip("\n") or any(
+        line.strip() == f"# install_root={root}" for line in text.splitlines()
     )
 
 
@@ -531,6 +585,7 @@ def do_install(
             }
             if owned_serve:
                 config["tailscale_serve"] = owned_serve
+            config["update"] = {"fingerprint": binary_fingerprint(binary)}
             atomic(root / "runtime.json", json.dumps(config) + "\n")
             atomic(root / "serve.py", Path(__file__).read_text())
             template = Path(__file__).with_name("opencode-serve.service.in").read_text()
@@ -541,8 +596,26 @@ def do_install(
                     for x in [executable(sys.executable), root / "serve.py", "run", "--root", root]
                 ),
             )
+            update_unit = Path(__file__).with_name("opencode-serve-update.service.in").read_text()
+            update_unit = update_unit.replace(
+                "@EXEC@",
+                " ".join(
+                    quote(x)
+                    for x in (
+                        executable(sys.executable),
+                        root / "serve.py",
+                        "update",
+                        "--check",
+                        "--root",
+                        root,
+                    )
+                ),
+            )
+            update_timer = Path(__file__).with_name("opencode-serve-update.timer.in").read_text()
             unit_dir.mkdir(parents=True, exist_ok=True)
             atomic(unit_dir / "opencode-serve.service", unit)
+            atomic(unit_dir / "opencode-serve-update.service", update_unit)
+            atomic(unit_dir / "opencode-serve-update.timer", update_timer)
 
 
 def install(args):
@@ -866,15 +939,28 @@ def remove_installation(root, purge=False):
             if root.exists():
                 stack.enter_context(file_lock(root / ".install.lock"))
                 config = runtime_config(root)
+            update_unit = unit.with_name("opencode-serve-update.service")
+            timer = unit.with_name("opencode-serve-update.timer")
+            if (update_unit.exists() or update_unit.is_symlink()) and not unit_owned_by(
+                update_unit, "update", root, "--check"
+            ):
+                raise ValueError("update unit belongs to another installation; nothing removed")
+            if timer.is_symlink():
+                raise ValueError("refusing a symlink update timer; nothing removed")
+            if timer.exists() and not timer_owned_by(timer, root):
+                raise ValueError("update timer belongs to another installation; nothing removed")
+            if (unit.exists() or unit.is_symlink()) and not unit_owned_by(unit, "run", root):
+                raise ValueError("user unit belongs to another installation; nothing removed")
+            # Stopping the oneshot also releases any update waiting on our lock.
+            if timer.exists():
+                stopped = cmd(["systemctl", "--user", "disable", "--now", UPDATE_TIMER_NAME])
+                if stopped is None or stopped.returncode:
+                    raise ValueError("update timer stop unverified; no files removed")
+            if update_unit.exists():
+                stopped = cmd(["systemctl", "--user", "stop", "opencode-serve-update.service"])
+                if stopped is None or stopped.returncode:
+                    raise ValueError("update service stop unverified; no files removed")
             if unit.exists() or unit.is_symlink():
-                exec_lines = [
-                    line for line in unit.read_text().splitlines() if line.startswith("ExecStart=")
-                ]
-                suffix = " " + " ".join(
-                    quote(x) for x in (root / "serve.py", "run", "--root", root)
-                )
-                if len(exec_lines) != 1 or not exec_lines[0].endswith(suffix):
-                    raise ValueError("user unit belongs to another installation; nothing removed")
                 stopped = cmd(["systemctl", "--user", "disable", "--now", "opencode-serve.service"])
                 active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
                 if (
@@ -897,7 +983,8 @@ def remove_installation(root, purge=False):
                 if cleared:
                     config.pop("tailscale_serve", None)
                 atomic(root / "runtime.json", json.dumps(config) + "\n")
-            unit.unlink(missing_ok=True)
+            for path in (timer, update_unit, unit):
+                path.unlink(missing_ok=True)
             reloaded = cmd(["systemctl", "--user", "daemon-reload"])
             if reloaded is None or reloaded.returncode:
                 raise ValueError("unit removed; run systemctl --user daemon-reload before retrying")
@@ -930,6 +1017,70 @@ def remove_main(argv):
     except (OSError, ValueError):
         print(
             "opencode-serve: removal failed; check the install root, unit ownership, and systemctl --user status opencode-serve.service",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def update_installation(root, check=False):
+    """Restart the server unit after a binary change (check) or on demand (manual)."""
+    root = Path(root).absolute()
+    with operation_lock():
+        if not root.exists() and not root.is_symlink():
+            if check:
+                return  # Timer fired for an uninstalled root: quiet no-op.
+            raise ValueError("opencode-serve is not installed")
+        if root.is_symlink():
+            raise ValueError("refusing a symlink install root")
+        with file_lock(root / ".install.lock"):
+            config = runtime_config(root)
+            if config.get("removed") or not recognized_install(root, config):
+                raise ValueError("directory is not an active opencode-serve installation")
+            config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+            if not unit_owned_by(config_home / "systemd/user/opencode-serve.service", "run", root):
+                raise ValueError("user unit belongs to another installation")
+            binary = config.get("binary")
+            if not isinstance(binary, str) or not binary:
+                raise ValueError("configured binary invalid")
+            fingerprint = binary_fingerprint(binary)
+            update = config.get("update")
+            baseline = update.get("fingerprint") if isinstance(update, dict) else None
+            if check:
+                if baseline is None:
+                    config["update"] = {"fingerprint": fingerprint}
+                    atomic(root / "runtime.json", json.dumps(config) + "\n")
+                    return
+                if baseline == fingerprint:
+                    return
+                time.sleep(5)  # Let an in-progress binary replacement finish.
+                if binary_fingerprint(binary) != fingerprint:
+                    return  # Still changing; retry next run, baseline unchanged.
+            done = cmd(["systemctl", "--user", "try-restart", "opencode-serve.service"])
+            if done is None or done.returncode:
+                raise ValueError("service try-restart failed; baseline not advanced")
+            config["update"] = {"fingerprint": fingerprint}
+            atomic(root / "runtime.json", json.dumps(config) + "\n")
+    if not check:
+        print("Update complete; active service restarted, inactive service untouched.")
+
+
+def update_main(argv):
+    parser = argparse.ArgumentParser(
+        description="Restart the server after the configured OpenCode binary changed."
+    )
+    parser.add_argument("--root", type=Path, default=default_root())
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="automatic mode: restart only when the binary changed; quiet on success",
+    )
+    args = parser.parse_args(argv)
+    try:
+        update_installation(args.root, args.check)
+    except (OSError, ValueError):
+        print(
+            "opencode-serve: update failed; check the install root, unit ownership, and systemctl --user status opencode-serve.service",
             file=sys.stderr,
         )
         return 1
@@ -1096,6 +1247,15 @@ def guided_install():
                                 file=sys.stderr,
                             )
                         else:
+                            timed = cmd(
+                                ["systemctl", "--user", "enable", "--now", UPDATE_TIMER_NAME]
+                            )
+                            if timed is None or timed.returncode:
+                                print(
+                                    "Update timer enable failed (service itself started)."
+                                    f" Run: systemctl --user enable --now {UPDATE_TIMER_NAME}",
+                                    file=sys.stderr,
+                                )
                             active = cmd(
                                 ["systemctl", "--user", "is-active", "opencode-serve.service"]
                             )
@@ -1292,8 +1452,10 @@ def main():
         return completion_main(sys.argv[2:])
     if sys.argv[1:2] == ["remove"]:
         return remove_main(sys.argv[2:])
+    if sys.argv[1:2] == ["update"]:
+        return update_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["install", "run", "completion", "remove"])
+    parser.add_argument("action", choices=["install", "run", "update", "completion", "remove"])
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--secrets", type=Path, default=None)
     parser.add_argument("--opencode", default=None)
@@ -1327,8 +1489,8 @@ def main():
         help="install allowed browser origin (repeatable or comma-separated; omit to keep)",
     )
     args = parser.parse_args()
-    if args.action in ("completion", "remove"):
-        parser.error("use completion or remove as the first argument")
+    if args.action in ("completion", "remove", "update"):
+        parser.error(f"use {args.action} as the first argument")
     args.use_ts = None if args.use_ts is None else args.use_ts == "true"
     if args.action == "run" and (args.use_ts is not None or args.hostname is not None):
         parser.error("--use-ts and --hostname are install-time options; run uses runtime.json")

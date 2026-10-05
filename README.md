@@ -20,8 +20,9 @@ prints the completion script. `--force` replaces an existing completion file;
 without it, installation refuses to overwrite one.
 
 Completions work with direct invocation (`./serve.py`, `/path/to/serve.py`, or
-`serve.py` on your `PATH`). They complete actions, flags, shell names, and file
-or directory arguments. Password and port values have no suggestions. Invoking
+`serve.py` on your `PATH`). They complete actions (`install`, `run`, `update`,
+`remove`, `completion`), flags, shell names, and file or directory arguments.
+Password and port values have no suggestions. Invoking
 the script through `python3 serve.py` uses Python's shell completion instead.
 
 Installations go to the standards-based per-shell user directories and never
@@ -80,13 +81,15 @@ only user completions; it does not install or start the server.
    - A summary before anything is written; Ctrl-C, EOF, or `n` cancels with
      zero changes. Cancel/EOF are safe at every prompt.
 3. If you accept, it writes files, then offers: `systemctl --user
-daemon-reload` + `enable --now` (or an explicit restart on reinstall),
-   optional `loginctl enable-linger` (run yourself if it needs permission; the
-   installer never uses sudo), and Tailscale Serve exposure when selected
-   (tailnet-only HTTPS via `tailscale serve --bg http://127.0.0.1:PORT`). If
-   Serve is root-managed, a failed `serve` prints only the matching `sudo`
-   recovery command (never run by the installer); `sudo tailscale set
---operator=$USER` is shown as optional broader access.
+daemon-reload` + `enable --now` (or an explicit restart on reinstall).
+   Accepting also enables the `opencode-serve-update.timer` auto-update timer.
+   It also offers optional `loginctl enable-linger` (run yourself if it needs
+   permission; the installer never uses sudo), and Tailscale Serve exposure
+   when selected (tailnet-only HTTPS via
+   `tailscale serve --bg http://127.0.0.1:PORT`). If Serve is root-managed, a
+   failed `serve` prints only the matching `sudo` recovery command (never run
+   by the installer); `sudo tailscale set --operator=$USER` is shown as
+   optional broader access.
 4. The database is isolated: the server uses `<root>/data/server.db` and only
    the refs-file keys; host logins and ambient API keys are not shared.
 5. Password stays private; the installer never prints it. Retrieve it with
@@ -144,8 +147,11 @@ OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
    `OPENCODE_SERVE_`, or `_`. Relative `--secrets` paths resolve against the
    current directory, independent of `--root`.
 2. Writes `<root>/` (`config/ data/ state/ cache/ runtime.json serve.py`,
-   password `config/opencode/service.json`) and the unit
-   `~/.config/systemd/user/opencode-serve.service`. Unit names are fixed;
+   password `config/opencode/service.json`) and the units
+   `~/.config/systemd/user/opencode-serve.service`,
+   `opencode-serve-update.service` (oneshot), and
+   `opencode-serve-update.timer` (`OnCalendar` every 2 minutes,
+   `Persistent=true`). Unit names are fixed;
    rerun install after moving root. First installation requires an empty,
    dedicated root, except for `.install.lock` and a real (not symlink)
    `completions/` directory from legacy shell completion installs, which
@@ -157,7 +163,8 @@ OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
    `~/.local/state/opencode-serve/operation.lock`. Fails closed: any fetch/validation error
    aborts before replacing working files. Secret values already fetched in
    `runtime.json` are replaced only when a refs file is given.
-3. `systemctl --user daemon-reload && systemctl --user enable --now opencode-serve.service`
+3. Explicit-flag installs do not start units. Start both with:
+   `systemctl --user daemon-reload && systemctl --user enable --now opencode-serve.service opencode-serve-update.timer`.
 4. Password retrieval as above. To rotate: stop the unit, rerun the installer
    with `--password PASSWORD` (or enter a new password in guided setup), then
    start the unit. To generate a fresh random password, stop the unit, remove
@@ -170,7 +177,7 @@ OPENCODE_CONFIG OPENCODE_CONFIG_DIR`, plus anything starting `XDG_`,
 ```sh
 ./serve.py install --use-ts false --hostname 192.168.1.20 --port 4096
 systemctl --user daemon-reload
-systemctl --user enable --now opencode-serve.service
+systemctl --user enable --now opencode-serve.service opencode-serve-update.timer
 # On an already running installation, apply changed settings with:
 systemctl --user restart opencode-serve.service
 ```
@@ -190,6 +197,30 @@ mapping previously created by guided setup; if that mapping has become shared
 or cannot be inspected, the networking change fails so you can resolve it
 manually. Untracked/manual Serve routes are preserved.
 
+## Updating OpenCode
+
+Adopt an upgraded OpenCode binary: `update` never upgrades OpenCode itself —
+run `opencode upgrade` first. It restarts the currently active
+`opencode-serve.service` via `systemctl --user try-restart` so the server
+adopts the already-installed configured binary. It never starts an inactive
+service. A restart drops connected clients.
+
+```sh
+python3 serve.py update [--root DIR]
+```
+
+`update --check` is the timer mode: stat the configured binary (following
+symlinks), wait 5s for a stable replacement, and restart only if the binary
+changed and the service is active. The first check on a legacy (pre-timer)
+install records a baseline without restarting.
+
+Installs also write `opencode-serve-update.service` (oneshot) and
+`opencode-serve-update.timer` (`OnCalendar` every 2 minutes,
+`Persistent=true`). Existing installs: rerun `install` to get the timer
+units, then enable the timer (`systemctl --user enable --now
+opencode-serve-update.timer`). Guided installs enable the timer when you
+accept the service start.
+
 ## Remove / uninstall
 
 ```sh
@@ -198,9 +229,10 @@ manually. Untracked/manual Serve routes are preserved.
 ```
 
 The root defaults to `~/.local/share/opencode-serve`. Removal verifies unit
-ownership, disables/stops the user service, confirms it is inactive, removes
-the unit, and reloads systemd. It then removes the copied launcher while keeping
-the database, `runtime.json` (including saved provider credentials), password,
+ownership, disables/stops the user service, disables the update timer, stops
+the update oneshot, confirms the service is inactive, removes all three units,
+and reloads systemd. It then removes the copied launcher while keeping the
+database, `runtime.json` (including saved provider credentials), password,
 and remaining config/state/cache files. Reinstall with your original options
 to use the retained data. `--purge` deletes the complete installation directory,
 including credentials, database, and any `completions/` directory under that
@@ -238,11 +270,16 @@ Keep ACLs tight, rotate often.
 ## Layout
 
 - `serve.py` — installer + launcher (`install` guided or flagged / `run`),
-  uninstaller (`remove`, optional `--purge`), plus
-  shell completion generation and installation (`completion`).
+  uninstaller (`remove`, optional `--purge`), binary auto-adoption
+  (`update`, `update --check` timer mode), plus shell completion generation
+  and installation (`completion`).
 - `opencode-serve.service.in` — unit template (`@EXEC@` quoted for
   spaces/`%`/`$`; `Type=simple`, `Restart=on-failure`, `UMask=0077`,
   `PrivateTmp=yes` hardening — needs real HOME/XDG/network).
+- `opencode-serve-update.service.in` / `opencode-serve-update.timer.in` —
+  templates for the oneshot unit running `update --check` and timer
+  (`OnCalendar` every 2 minutes, `Persistent=true`), written without `.in`
+  to `~/.config/systemd/user/` at install.
 - `test_serve.py` — `python3 test_serve.py`: fake `op`/`opencode`, temp
   HOME/XDG/systemd dirs; covers stable reinstall, failed-fetch keeps working
   config, special values, port validation/persistence, run argv/env isolation,

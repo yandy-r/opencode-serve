@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart opencode-serve when the configured OpenCode binary changes
+
+[Service]
+Type=oneshot
+ExecStart=@EXEC@
+UMask=0077
+PrivateTmp=yes
