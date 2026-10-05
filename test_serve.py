@@ -1447,6 +1447,75 @@ def update_checks(mod, base, home):
                 and not update_unit.exists()
                 and not foreign.exists(),
             )
+
+            # Reinstall never restarts, so it must keep the old baseline.
+            install(root)
+            first = baseline(root)
+            replace_real("#!/bin/sh\n# upgraded before reinstall\nexit 0\n")
+            install(root)
+            mod.update_installation(root, check=True)
+            check(
+                "reinstall keeps baseline so timer still restarts old process",
+                calls == [restart] and baseline(root) != first,
+            )
+
+            calls.clear()
+            first = baseline(root)
+            real.rename(ubin / "moved-away")
+            mod.update_installation(root, check=True)
+            check(
+                "update check quiet while binary briefly missing",
+                not calls and baseline(root) == first,
+            )
+            try:
+                mod.update_installation(root)
+                missing_refused = False
+            except OSError:
+                missing_refused = True
+            check("manual update fails while binary missing", missing_refused and not calls)
+            (ubin / "moved-away").rename(real)
+
+            def stop_fails(argv):
+                calls.append(list(argv))
+                failing = argv[2:3] == ["disable"] and "opencode-serve.service" in argv
+                return subprocess.CompletedProcess(argv, 1 if failing else 0, b"", b"")
+
+            calls.clear()
+            with mock.patch.object(mod, "cmd", stop_fails):
+                try:
+                    mod.remove_installation(root)
+                    stop_refused = False
+                except ValueError:
+                    stop_refused = True
+            check(
+                "failed server stop leaves update timer enabled",
+                stop_refused
+                and not any(mod.UPDATE_TIMER_NAME in c for c in calls)
+                and timer.exists(),
+            )
+            calls.clear()
+            mod.remove_installation(root)
+            server_stop = ["systemctl", "--user", "disable", "--now", "opencode-serve.service"]
+            timer_stop = ["systemctl", "--user", "disable", "--now", mod.UPDATE_TIMER_NAME]
+            check(
+                "remove disables timer only after server stop",
+                server_stop in calls
+                and timer_stop in calls
+                and calls.index(server_stop) < calls.index(timer_stop),
+            )
+
+            install(root)
+            update_unit.unlink()
+            calls.clear()
+            try:
+                mod.remove_installation(root)
+                template_refused = False
+            except ValueError:
+                template_refused = True
+            check(
+                "template timer without owned update unit is not removed",
+                template_refused and timer.exists() and not calls,
+            )
     finally:
         os.environ.clear()
         os.environ.update(saved)

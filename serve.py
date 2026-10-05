@@ -585,7 +585,14 @@ def do_install(
             }
             if owned_serve:
                 config["tailscale_serve"] = owned_serve
-            config["update"] = {"fingerprint": binary_fingerprint(binary)}
+            # Keep a prior baseline: reinstall does not restart, so a still-running old
+            # binary must remain detectable by the timer.
+            kept = previous.get("update")
+            config["update"] = (
+                kept
+                if isinstance(kept, dict) and kept.get("fingerprint")
+                else {"fingerprint": binary_fingerprint(binary)}
+            )
             atomic(root / "runtime.json", json.dumps(config) + "\n")
             atomic(root / "serve.py", Path(__file__).read_text())
             template = Path(__file__).with_name("opencode-serve.service.in").read_text()
@@ -947,15 +954,14 @@ def remove_installation(root, purge=False):
                 raise ValueError("update unit belongs to another installation; nothing removed")
             if timer.is_symlink():
                 raise ValueError("refusing a symlink update timer; nothing removed")
-            if timer.exists() and not timer_owned_by(timer, root):
+            if timer.exists() and (
+                not timer_owned_by(timer, root)
+                or not unit_owned_by(update_unit, "update", root, "--check")
+            ):
                 raise ValueError("update timer belongs to another installation; nothing removed")
             if (unit.exists() or unit.is_symlink()) and not unit_owned_by(unit, "run", root):
                 raise ValueError("user unit belongs to another installation; nothing removed")
             # Stopping the oneshot also releases any update waiting on our lock.
-            if timer.exists():
-                stopped = cmd(["systemctl", "--user", "disable", "--now", UPDATE_TIMER_NAME])
-                if stopped is None or stopped.returncode:
-                    raise ValueError("update timer stop unverified; no files removed")
             if update_unit.exists():
                 stopped = cmd(["systemctl", "--user", "stop", "opencode-serve-update.service"])
                 if stopped is None or stopped.returncode:
@@ -974,6 +980,11 @@ def remove_installation(root, purge=False):
                 active = cmd(["systemctl", "--user", "is-active", "opencode-serve.service"])
                 if active is None or active.returncode not in (3, 4):
                     raise ValueError("unit is missing and shutdown is unverified; no files removed")
+            # After the server stop is verified, so a failed removal keeps auto-update on.
+            if timer.exists():
+                stopped = cmd(["systemctl", "--user", "disable", "--now", UPDATE_TIMER_NAME])
+                if stopped is None or stopped.returncode:
+                    raise ValueError("update timer stop unverified; no files removed")
             if config:
                 # A failed/shared Serve cleanup never removes other apps' mappings.
                 cleared = clear_owned_serve(config)
@@ -1043,7 +1054,12 @@ def update_installation(root, check=False):
             binary = config.get("binary")
             if not isinstance(binary, str) or not binary:
                 raise ValueError("configured binary invalid")
-            fingerprint = binary_fingerprint(binary)
+            try:
+                fingerprint = binary_fingerprint(binary)
+            except FileNotFoundError:
+                if check:
+                    return  # Transient unlink during upgrade: try next tick.
+                raise
             update = config.get("update")
             baseline = update.get("fingerprint") if isinstance(update, dict) else None
             if check:
@@ -1054,8 +1070,11 @@ def update_installation(root, check=False):
                 if baseline == fingerprint:
                     return
                 time.sleep(5)  # Let an in-progress binary replacement finish.
-                if binary_fingerprint(binary) != fingerprint:
-                    return  # Still changing; retry next run, baseline unchanged.
+                try:
+                    if binary_fingerprint(binary) != fingerprint:
+                        return  # Still changing; retry next run, baseline unchanged.
+                except FileNotFoundError:
+                    return
             done = cmd(["systemctl", "--user", "try-restart", "opencode-serve.service"])
             if done is None or done.returncode:
                 raise ValueError("service try-restart failed; baseline not advanced")

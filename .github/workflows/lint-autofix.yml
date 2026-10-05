@@ -37,6 +37,12 @@ jobs:
         with:
           node-version: lts/*
 
+      - name: Install pinned Node dev tools
+        # style.sh refuses the npx fallback and this repo has no package.json,
+        # so seed node_modules/.bin with exact pinned versions. --no-save plus
+        # the tracked-only `git add -u` below keeps these files out of commits.
+        run: npm install --no-save --package-lock=false prettier@3.6.2 markdownlint-cli@0.45.0
+
       - name: Apply formatters
         run: ./scripts/style.sh format
 
