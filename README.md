@@ -110,7 +110,11 @@ line instead of hanging or changing services.
 
 ## Automated path (explicit flags — noninteractive)
 
-`python3 serve.py install --root DIR --secrets FILE --opencode PATH --port PORT --password PASSWORD --use-ts true --cors ORIGIN`
+```sh
+python3 serve.py install --root DIR --secrets FILE --opencode PATH --port PORT \
+  --password PASSWORD --use-ts true --cors ORIGIN
+```
+
 (any subset; passing any flag selects this mode). It only installs, exactly as
 before:
 
