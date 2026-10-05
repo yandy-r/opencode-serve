@@ -488,6 +488,7 @@ def main():
         cors_checks(load(), base, home, bindir)
         remove_checks(load(), base, home, bindir)
         tailscale_cleanup_checks(load(), base, home, bindir)
+        update_checks(load(), base, home)
     print("result:", "ALL PASS" if not failures else f"FAILURES {failures}")
     return 1 if failures else 0
 
@@ -1225,6 +1226,297 @@ def tailscale_cleanup_checks(mod, base, home, bindir):
         )
     finally:
         mod.cmd, mod.shutil.which = original_cmd, original_which
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def update_checks(mod, base, home):
+    import contextlib
+    import io
+    from unittest import mock
+
+    saved = guided_env(home)
+    ubin = base / "update-bin"
+    ubin.mkdir()
+    real, link = ubin / "real-opencode", ubin / "opencode"
+    real.write_text("#!/bin/sh\nexit 0\n")
+    real.chmod(0o755)
+    link.symlink_to(real)
+    unit_dir = home / ".config/systemd/user"
+    restart = ["systemctl", "--user", "try-restart", "opencode-serve.service"]
+    calls, rc = [], [0]
+
+    def fake_cmd(argv):
+        calls.append(list(argv))
+        if rc[0] is None:
+            return None
+        code = 3 if "is-active" in argv and rc[0] == 0 else rc[0]
+        return subprocess.CompletedProcess(argv, code, b"", b"")
+
+    def install(root):
+        mod.do_install(root, {}, str(link), 4096, keep_env={}, use_ts=False)
+        calls.clear()
+        rc[0] = 0
+
+    def baseline(root):
+        return json.loads((root / "runtime.json").read_text()).get("update", {}).get("fingerprint")
+
+    def refuses(*args, **kwargs):
+        try:
+            mod.update_installation(*args, **kwargs)
+        except ValueError:
+            return True
+        return False
+
+    def replace_real(text):
+        tmp = ubin / "replacement"
+        tmp.write_text(text)
+        tmp.chmod(0o755)
+        os.replace(tmp, real)
+
+    root = base / "update-root"
+    try:
+        with (
+            mock.patch.object(mod, "cmd", fake_cmd),
+            mock.patch.object(mod.time, "sleep", lambda s: None),
+        ):
+            install(root)
+            first = baseline(root)
+            check(
+                "update install records baseline and timer ownership",
+                first == mod.binary_fingerprint(str(link))
+                and mod.timer_owned_by(unit_dir / mod.UPDATE_TIMER_NAME, root)
+                and mod.unit_owned_by(
+                    unit_dir / "opencode-serve-update.service", "update", root, "--check"
+                ),
+            )
+
+            before = (root / "runtime.json").read_text()
+            mod.update_installation(root, check=True)
+            check(
+                "update check unchanged is quiet no-op",
+                not calls and (root / "runtime.json").read_text() == before,
+            )
+
+            replace_real("#!/bin/sh\n# stable replacement\nexit 0\n")
+            mod.update_installation(root, check=True)
+            check(
+                "update check restarts and advances baseline after stable replacement",
+                calls == [restart]
+                and baseline(root) != first
+                and baseline(root) == mod.binary_fingerprint(str(link)),
+            )
+            calls.clear()
+            mod.update_installation(root, check=True)
+            check("update check quiet after baseline advanced", not calls)
+
+            install(root)
+            other = ubin / "other-target"
+            other.write_text("#!/bin/sh\n# retargeted\nexit 0\n")
+            other.chmod(0o755)
+            link.unlink()
+            link.symlink_to(other)
+            first = baseline(root)
+            mod.update_installation(root, check=True)
+            check(
+                "update check follows symlink target replacement",
+                calls == [restart]
+                and baseline(root) != first
+                and baseline(root) == mod.binary_fingerprint(str(link)),
+            )
+            link.unlink()
+            link.symlink_to(real)
+
+            install(root)
+            first = baseline(root)
+
+            def churn(seconds):
+                replace_real("#!/bin/sh\n# changed during sleep, longer content\nexit 0\n")
+
+            replace_real("#!/bin/sh\n# first change\nexit 0\n")
+            with mock.patch.object(mod.time, "sleep", churn):
+                mod.update_installation(root, check=True)
+            check(
+                "update check leaves baseline when binary churns during settle sleep",
+                not calls and baseline(root) == first,
+            )
+            mod.update_installation(root, check=True)
+            check(
+                "update check restarts once binary settles",
+                calls == [restart] and baseline(root) == mod.binary_fingerprint(str(link)),
+            )
+
+            install(root)
+            first = baseline(root)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mod.update_installation(root)
+            check(
+                "manual update try-restarts without starting inactive service",
+                calls == [restart]
+                and baseline(root) == first
+                and "inactive service untouched" in out.getvalue()
+                and not any(c[2] in ("start", "restart", "enable") for c in calls),
+            )
+
+            replace_real("#!/bin/sh\n# failing restart\nexit 0\n")
+            first = baseline(root)
+            for failure in (1, None):
+                calls.clear()
+                rc[0] = failure
+                check(
+                    "failed try-restart raises and leaves baseline",
+                    refuses(root, check=True) and baseline(root) == first and calls == [restart],
+                )
+            rc[0] = 1
+            check(
+                "manual update failure leaves baseline",
+                refuses(root) and baseline(root) == first,
+            )
+            rc[0] = 0
+
+            install(root)
+            data = json.loads((root / "runtime.json").read_text())
+            data.pop("update")
+            (root / "runtime.json").write_text(json.dumps(data))
+            replace_real("#!/bin/sh\n# legacy install\nexit 0\n")
+            calls.clear()
+            mod.update_installation(root, check=True)
+            check(
+                "legacy missing baseline saved without restart",
+                not calls and baseline(root) == mod.binary_fingerprint(str(link)),
+            )
+
+            install(root)
+            foreign = base / "update-foreign"
+            mod.do_install(foreign, {}, str(link), 4097, keep_env={}, use_ts=False)
+            calls.clear()
+            first = baseline(root)
+            check(
+                "update refuses unit owned by another root",
+                refuses(root, check=True)
+                and refuses(root)
+                and not calls
+                and baseline(root) == first,
+            )
+            check(
+                "update missing root: check quiet, manual refuses",
+                not mod.update_installation(base / "update-absent", check=True)
+                and refuses(base / "update-absent"),
+            )
+            removed = json.loads((foreign / "runtime.json").read_text())
+            removed["removed"] = True
+            (foreign / "runtime.json").write_text(json.dumps(removed))
+            check("update refuses removed installation", refuses(foreign, check=True))
+
+            # Timer cleanup and ownership.
+            install(foreign)
+            timer = unit_dir / mod.UPDATE_TIMER_NAME
+            update_unit = unit_dir / "opencode-serve-update.service"
+            marker_text = f"[Timer]\nOnCalendar=daily\n# install_root={foreign}\n"
+            timer.write_text("[Timer]\nOnCalendar=daily\n")
+            check(
+                "custom timer without marker not owned",
+                not mod.timer_owned_by(timer, foreign),
+            )
+            timer.write_text(marker_text)
+            check(
+                "custom timer with install_root marker owned",
+                mod.timer_owned_by(timer, foreign) and not mod.timer_owned_by(timer, root),
+            )
+            timer.unlink()
+            timer.symlink_to(real)
+            check("symlink timer not owned", not mod.timer_owned_by(timer, foreign))
+            timer.unlink()
+            timer.write_text("[Timer]\nOnCalendar=daily\n")
+            try:
+                mod.remove_installation(foreign, purge=True)
+                refused = False
+            except ValueError:
+                refused = True
+            check(
+                "remove refuses foreign update timer",
+                refused and timer.exists() and foreign.exists() and not calls,
+            )
+            timer.write_text(mod.UPDATE_TIMER_TEXT)
+            mod.remove_installation(foreign, purge=True)
+            check(
+                "remove disables owned timer and deletes timer and update unit",
+                ["systemctl", "--user", "disable", "--now", mod.UPDATE_TIMER_NAME] in calls
+                and not timer.exists()
+                and not update_unit.exists()
+                and not foreign.exists(),
+            )
+
+            # Reinstall never restarts, so it must keep the old baseline.
+            install(root)
+            first = baseline(root)
+            replace_real("#!/bin/sh\n# upgraded before reinstall\nexit 0\n")
+            install(root)
+            mod.update_installation(root, check=True)
+            check(
+                "reinstall keeps baseline so timer still restarts old process",
+                calls == [restart] and baseline(root) != first,
+            )
+
+            calls.clear()
+            first = baseline(root)
+            real.rename(ubin / "moved-away")
+            mod.update_installation(root, check=True)
+            check(
+                "update check quiet while binary briefly missing",
+                not calls and baseline(root) == first,
+            )
+            try:
+                mod.update_installation(root)
+                missing_refused = False
+            except OSError:
+                missing_refused = True
+            check("manual update fails while binary missing", missing_refused and not calls)
+            (ubin / "moved-away").rename(real)
+
+            def stop_fails(argv):
+                calls.append(list(argv))
+                failing = argv[2:3] == ["disable"] and "opencode-serve.service" in argv
+                return subprocess.CompletedProcess(argv, 1 if failing else 0, b"", b"")
+
+            calls.clear()
+            with mock.patch.object(mod, "cmd", stop_fails):
+                try:
+                    mod.remove_installation(root)
+                    stop_refused = False
+                except ValueError:
+                    stop_refused = True
+            check(
+                "failed server stop leaves update timer enabled",
+                stop_refused
+                and not any(mod.UPDATE_TIMER_NAME in c for c in calls)
+                and timer.exists(),
+            )
+            calls.clear()
+            mod.remove_installation(root)
+            server_stop = ["systemctl", "--user", "disable", "--now", "opencode-serve.service"]
+            timer_stop = ["systemctl", "--user", "disable", "--now", mod.UPDATE_TIMER_NAME]
+            check(
+                "remove disables timer only after server stop",
+                server_stop in calls
+                and timer_stop in calls
+                and calls.index(server_stop) < calls.index(timer_stop),
+            )
+
+            install(root)
+            update_unit.unlink()
+            calls.clear()
+            try:
+                mod.remove_installation(root)
+                template_refused = False
+            except ValueError:
+                template_refused = True
+            check(
+                "template timer without owned update unit is not removed",
+                template_refused and timer.exists() and not calls,
+            )
+    finally:
         os.environ.clear()
         os.environ.update(saved)
 

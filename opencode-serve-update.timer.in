@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for an updated OpenCode binary (opencode-serve)
+
+[Timer]
+OnCalendar=*:0/2
+Persistent=true
+Unit=opencode-serve-update.service
+
+[Install]
+WantedBy=timers.target
